@@ -15,13 +15,15 @@ init:
 before_build:
   - ps: .\build\Set-BuildVersion -Version $env:APPVEYOR_BUILD_VERSION -Suffix $env:VERSION_SUFFIX
   - nuget sources add -name Exceptionless -source https://www.myget.org/F/exceptionless/api/v3/index.json
-  - appveyor-retry dotnet restore -v Minimal
 
 build_script:
   - ps: dotnet build -c Release
 
 #on_failure:
 #  - ps: $blockRdp = $true; iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
+
+test_script:
+  - ps: dotnet test .\test\Foundatio.AWS.Tests\Foundatio.AWS.Tests.csproj -c Release
 
 after_test:
   - ps: dotnet pack -c Release
