@@ -3,6 +3,7 @@
 [![Build status](https://ci.appveyor.com/api/projects/status/xdky8avbt35xr50p?svg=true)](https://ci.appveyor.com/project/Exceptionless/foundatio-aws-mi5u6)
 [![NuGet Version](http://img.shields.io/nuget/v/Foundatio.AWS.svg?style=flat)](https://www.nuget.org/packages/Foundatio.AWS/)
 [![Slack Status](https://slack.exceptionless.com/badge.svg)](https://slack.exceptionless.com)
+[![Help Contribute to Open Source](https://www.codetriage.com/foundatiofx/foundatio.aws/badges/users.svg)](https://www.codetriage.com/foundatiofx/foundatio.aws)
 
 Pluggable foundation blocks for building loosely coupled distributed apps.
 - [Caching](#caching)
