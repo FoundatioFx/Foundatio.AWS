@@ -11,12 +11,11 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 		appveyor.yml = appveyor.yml
 		build\common.props = build\common.props
 		README.md = README.md
-		build\sourcelink.props = build\sourcelink.props
 	EndProjectSection
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Foundatio.AWS", "src\Foundatio.AWS\Foundatio.AWS.csproj", "{EAE3607D-73A1-4D02-BDAA-24A37DDA15CB}"
 EndProject
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Foundatio.AWS.Tests", "test\Foundatio.AWS.Tests\Foundatio.AWS.Tests.csproj", "{9832E1F4-C826-4704-890A-00F330BC5913}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Foundatio.AWS.Tests", "tests\Foundatio.AWS.Tests\Foundatio.AWS.Tests.csproj", "{9832E1F4-C826-4704-890A-00F330BC5913}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
