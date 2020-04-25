@@ -23,6 +23,8 @@ jobs:
         tag-prefix: v
     - name: Build
       run: dotnet build --configuration Release
+    - name: Start Services
+      run: docker-compose up -d && docker-compose up ready
     - name: Run Tests
       run: dotnet test --configuration Release --results-directory artifacts --no-build --logger:trx
     - name: Package
