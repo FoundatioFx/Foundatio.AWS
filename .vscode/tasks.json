@@ -36,6 +36,14 @@
       "command": "dotnet pack -c Release -o ${workspaceFolder}/artifacts",
       "type": "shell",
       "problemMatcher": []
+    },
+    {
+      "label": "docker: aws",
+      "command": "docker-compose up",
+      "type": "shell",
+      "isBackground": true,
+      "group": "test",
+      "problemMatcher": []
     }
   ]
 }
