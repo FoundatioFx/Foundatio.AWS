@@ -184,9 +184,12 @@ namespace Foundatio.AWS.Tests.Queues {
                     Assert.Equal(1, stats.Enqueued);
                     Assert.Equal(0, stats.Queued);
                     Assert.Equal(0, stats.Working);
+                }
 
-                    await SystemClock.SleepAsync(TimeSpan.FromSeconds(3));
-                    stats = await queue.GetQueueStatsAsync();
+                await SystemClock.SleepAsync(TimeSpan.FromSeconds(3));
+                
+                if (_assertStats) {
+                    var stats = await queue.GetQueueStatsAsync();
                     Assert.Equal(0, stats.Dequeued);
                     Assert.Equal(1, stats.Enqueued);
                     Assert.Equal(1, stats.Queued);
