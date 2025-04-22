@@ -1,6 +1,6 @@
 services:
   localstack:
-    image: localstack/localstack:4.1.0
+    image: localstack/localstack:4.3.0
     ports:
       - 4563-4599:4563-4599
       - 8055:8080
