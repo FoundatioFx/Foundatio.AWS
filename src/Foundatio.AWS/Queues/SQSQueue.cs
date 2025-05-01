@@ -1,17 +1,18 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Amazon;
 using Amazon.Runtime;
+using Amazon.Runtime.Credentials;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using Foundatio.AsyncEx;
 using Foundatio.Extensions;
 using Foundatio.Serializer;
 using Microsoft.Extensions.Logging;
-using ThirdParty.Json.LitJson;
 
 namespace Foundatio.Queues;
 
@@ -33,7 +34,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         // TODO: Flow through the options like retries and the like.
         _client = new Lazy<AmazonSQSClient>(() =>
         {
-            var credentials = options.Credentials ?? FallbackCredentialsFactory.GetCredentials();
+            var credentials = options.Credentials ?? DefaultAWSCredentialsIdentityResolver.GetCredentials();
 
             if (String.IsNullOrEmpty(options.ServiceUrl))
             {
@@ -462,7 +463,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         var maxReceiveCount = Math.Max(_options.Retries + 1, 1);
         // step 4, set retry policy
-        var redrivePolicy = new JsonData
+        var redrivePolicy = new JsonObject
         {
             ["maxReceiveCount"] = maxReceiveCount.ToString(),
             ["deadLetterTargetArn"] = deadAttributeResponse.QueueARN
@@ -470,7 +471,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         var attributes = new Dictionary<string, string>
         {
-            [QueueAttributeName.RedrivePolicy] = JsonMapper.ToJson(redrivePolicy)
+            [QueueAttributeName.RedrivePolicy] = redrivePolicy.ToJsonString()
         };
 
         var setAttributeRequest = new SetQueueAttributesRequest(_queueUrl, attributes);
