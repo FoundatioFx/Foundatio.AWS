@@ -1,15 +1,22 @@
-version: '2.1'
 services:
   localstack:
-    image: localstack/localstack:0.14.2
+    image: localstack/localstack:4.3.0
     ports:
-      - '4563-4599:4563-4599'
-      - '8055:8080'
+      - 4563-4599:4563-4599
+      - 8055:8080
     environment:
       - SERVICES=sqs,sns,s3,cloudwatch
       - DEBUG=1
+    volumes:
+      - "localstackdata:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
   ready:
-    image: dadarek/wait-for-dependencies
+    image: andrewlock/wait-for-dependencies
     command: localstack:4566
     depends_on:
       - localstack
+
+volumes:
+  localstackdata:
+    driver: local
