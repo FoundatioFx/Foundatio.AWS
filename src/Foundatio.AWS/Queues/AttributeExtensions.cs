@@ -69,7 +69,10 @@ public static class AttributeExtensions
             return null;
 
         using var redrivePolicy = JsonDocument.Parse(v);
-        string arn = redrivePolicy.RootElement.GetProperty("deadLetterTargetArn").GetString();
+        if (!redrivePolicy.RootElement.TryGetProperty("deadLetterTargetArn", out var arnElement))
+            return null;
+
+        string arn = arnElement.GetString();
         if (String.IsNullOrEmpty(arn))
             return null;
 
