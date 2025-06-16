@@ -138,10 +138,13 @@ public class S3FileStorage : IFileStorage
         try
         {
             var response = await _client.GetObjectMetadataAsync(req).AnyContext();
+            if (response.HttpStatusCode is HttpStatusCode.NotFound)
+                return null;
+
             if (!response.HttpStatusCode.IsSuccessful())
             {
                 _logger.LogDebug("[{HttpStatusCode}] Unable to get file info for {Path}", response.HttpStatusCode, req.Key);
-                return null;
+                throw new StorageException($"Invalid status code {response.HttpStatusCode} ({(int)response.HttpStatusCode}): Expected 200 OK or 404 NotFound");
             }
 
             return new FileSpec
