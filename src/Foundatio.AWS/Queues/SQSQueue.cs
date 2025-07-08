@@ -99,7 +99,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (options.DeliveryDelay.HasValue)
         {
             int delaySeconds = (int)options.DeliveryDelay.Value.TotalSeconds;
-            message.DelaySeconds = Math.Clamp(delaySeconds, 0, 900);
+            message.DelaySeconds = Math.Max(0, Math.Min(900, delaySeconds));
         }
 
         if (!String.IsNullOrEmpty(options.UniqueId))
