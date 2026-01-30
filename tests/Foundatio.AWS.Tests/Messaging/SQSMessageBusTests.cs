@@ -463,7 +463,7 @@ public class SQSMessageBusTests : MessageBusTestBase
     public async Task PublishAsync_WithMultipleMessageTypes_MemoizesTopicArns()
     {
         // Arrange
-        string defaultTopic = $"memo-{Guid.NewGuid():N}"[..40];
+        string defaultTopic = $"memo-{Guid.NewGuid():N}";
         var resolverCallCount = new ConcurrentDictionary<Type, int>();
 
         await using var messageBus = new SQSMessageBus(o => o
@@ -493,7 +493,7 @@ public class SQSMessageBusTests : MessageBusTestBase
     public async Task GetOrCreateTopicArnAsync_WhenCalledConcurrently_OnlyCreatesOnce()
     {
         // Arrange
-        string topicName = $"stress-{Guid.NewGuid():N}"[..40];
+        string topicName = $"stress-{Guid.NewGuid():N}";
 
         await using var messageBus = new SQSMessageBus(o => o
             .ConnectionString(GetConnectionString())
