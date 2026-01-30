@@ -513,10 +513,6 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
                     {
                         _logger.LogWarning(ex, "Receipt handle invalid for message {MessageId}, message may have been deleted", sqsMessage.MessageId);
                     }
-                    catch (AmazonServiceException ex)
-                    {
-                        _logger.LogError(ex, "AWS error processing message {MessageId}: {Message}", sqsMessage.MessageId, ex.Message);
-                    }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "Error processing message {MessageId}: {Message}", sqsMessage.MessageId, ex.Message);
@@ -532,36 +528,20 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
                 _logger.LogError(ex, "SQS queue no longer exists, stopping subscriber loop");
                 break;
             }
-            catch (AmazonServiceException ex)
-            {
-                _logger.LogError(ex, "AWS error in subscriber loop: {Message}", ex.Message);
-
-                if (!cancellationToken.IsCancellationRequested)
-                {
-                    try
-                    {
-                        await _timeProvider.Delay(TimeSpan.FromSeconds(1), cancellationToken).AnyContext();
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Ignored
-                    }
-                }
-            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in subscriber loop: {Message}", ex.Message);
 
-                if (!cancellationToken.IsCancellationRequested)
+                if (cancellationToken.IsCancellationRequested)
+                    break;
+
+                try
                 {
-                    try
-                    {
-                        await _timeProvider.Delay(TimeSpan.FromSeconds(1), cancellationToken).AnyContext();
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Ignored
-                    }
+                    await _timeProvider.Delay(TimeSpan.FromSeconds(1), cancellationToken).AnyContext();
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
                 }
             }
         }
