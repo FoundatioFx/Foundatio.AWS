@@ -797,7 +797,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
 
         string queueName = $"{_options.Topic}-{Guid.NewGuid():N}";
         if (queueName.Length > 80)
-            queueName = queueName.Substring(0, 80);
+            queueName = queueName[..80];
 
         return queueName;
     }

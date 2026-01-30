@@ -219,69 +219,55 @@ public class SQSMessageBusTests : MessageBusTestBase
         // Arrange
         string durableQueueName = $"durable-{Guid.NewGuid():N}"[..30];
 
-        var messageBus1 = new SQSMessageBus(o => o
+        // First message bus instance - durable (queue persists after dispose)
+        await using (var messageBus1 = new SQSMessageBus(o => o
             .ConnectionString(GetConnectionString())
             .Topic(_topic)
             .UseDurableSubscription(durableQueueName)
             .ReadQueueTimeout(TimeSpan.FromSeconds(1))
             .DequeueInterval(TimeSpan.FromMilliseconds(100))
-            .LoggerFactory(Log));
-
-        var countdownEvent1 = new AsyncCountdownEvent(1);
-        string receivedData1 = null;
-
-        await messageBus1.SubscribeAsync<SimpleMessageA>(msg =>
+            .LoggerFactory(Log)))
         {
-            receivedData1 = msg.Data;
-            countdownEvent1.Signal();
-        }, TestCancellationToken);
+            var countdownEvent1 = new AsyncCountdownEvent(1);
+            string receivedData1 = null;
 
-        // Act - First message bus
-        await messageBus1.PublishAsync(new SimpleMessageA { Data = "Message 1" }, cancellationToken: TestCancellationToken);
-        await countdownEvent1.WaitAsync(TestCancellationToken);
+            await messageBus1.SubscribeAsync<SimpleMessageA>(msg =>
+            {
+                receivedData1 = msg.Data;
+                countdownEvent1.Signal();
+            }, TestCancellationToken);
 
-        // Assert - First message bus
-        Assert.Equal("Message 1", receivedData1);
+            await messageBus1.PublishAsync(new SimpleMessageA { Data = "Message 1" }, cancellationToken: TestCancellationToken);
+            await countdownEvent1.WaitAsync(TestCancellationToken);
 
-        await messageBus1.DisposeAsync();
+            Assert.Equal("Message 1", receivedData1);
+        }
 
-        // Arrange - Second message bus (simulating restart)
-        var messageBus2 = new SQSMessageBus(o => o
+        // Second message bus instance (simulating restart) - uses same queue but enables auto-delete for cleanup
+        await using (var messageBus2 = new SQSMessageBus(o => o
             .ConnectionString(GetConnectionString())
             .Topic(_topic)
-            .UseDurableSubscription(durableQueueName)
+            .SubscriptionQueueName(durableQueueName)
+            .SubscriptionQueueAutoDelete(true) // Enable auto-delete for test cleanup
             .ReadQueueTimeout(TimeSpan.FromSeconds(1))
             .DequeueInterval(TimeSpan.FromMilliseconds(100))
-            .LoggerFactory(Log));
-
-        var countdownEvent2 = new AsyncCountdownEvent(1);
-        string receivedData2 = null;
-
-        await messageBus2.SubscribeAsync<SimpleMessageA>(msg =>
+            .LoggerFactory(Log)))
         {
-            receivedData2 = msg.Data;
-            countdownEvent2.Signal();
-        }, TestCancellationToken);
+            var countdownEvent2 = new AsyncCountdownEvent(1);
+            string receivedData2 = null;
 
-        // Act - Second message bus
-        await messageBus2.PublishAsync(new SimpleMessageA { Data = "Message 2" }, cancellationToken: TestCancellationToken);
-        await countdownEvent2.WaitAsync(TestCancellationToken);
+            await messageBus2.SubscribeAsync<SimpleMessageA>(msg =>
+            {
+                receivedData2 = msg.Data;
+                countdownEvent2.Signal();
+            }, TestCancellationToken);
 
-        // Assert - Second message bus
-        Assert.Equal("Message 2", receivedData2);
+            await messageBus2.PublishAsync(new SimpleMessageA { Data = "Message 2" }, cancellationToken: TestCancellationToken);
+            await countdownEvent2.WaitAsync(TestCancellationToken);
 
-        await messageBus2.DisposeAsync();
-
-        // Cleanup - Delete the durable queue (best effort, log any errors)
-        try
-        {
-            await messageBus2.SqsClient.DeleteQueueAsync(
-                (await messageBus2.SqsClient.GetQueueUrlAsync(durableQueueName, TestCancellationToken)).QueueUrl, TestCancellationToken);
+            Assert.Equal("Message 2", receivedData2);
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to cleanup durable queue {QueueName} after test", durableQueueName);
-        }
+        // Queue is automatically deleted when messageBus2 disposes
     }
 
     [Fact]
