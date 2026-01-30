@@ -213,7 +213,7 @@ public class SQSMessageBusTests : MessageBusTestBase
         return base.CanHandlePoisonedMessageAsync();
     }
 
-    [Fact]
+    [Fact] // 2 minute timeout for durable queue test
     public async Task SubscribeAsync_WithDurableQueue_PersistsAcrossRestarts()
     {
         // Arrange
@@ -328,7 +328,7 @@ public class SQSMessageBusTests : MessageBusTestBase
         Assert.Equal("DefaultTopicTest", receivedData);
     }
 
-    [Fact]
+    [Fact] // 2 minute timeout for multi-topic test
     public async Task PublishAsync_WithTopicResolver_RoutesToCorrectTopic()
     {
         // Arrange
@@ -512,7 +512,7 @@ public class SQSMessageBusTests : MessageBusTestBase
         Assert.True(tasks.All(t => t.IsCompletedSuccessfully));
     }
 
-    [Fact]
+    [Fact] // 2 minute timeout for multi-subscriber test
     public async Task PublishAsync_WithDifferentTopicsPerType_SubscribersReceiveCorrectMessages()
     {
         // Arrange

@@ -171,8 +171,8 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
     /// <param name="cancellationToken">A cancellation token.</param>
     /// <returns>The ARN of the SNS topic.</returns>
     /// <remarks>
-    /// This method uses double-check locking to ensure thread-safe topic creation.
     /// Topic ARNs are cached in a ConcurrentDictionary to avoid redundant AWS API calls.
+    /// Caller must hold the lock when topic creation may occur.
     /// </remarks>
     private async Task<string> GetOrCreateTopicArnAsync(string topicName, CancellationToken cancellationToken)
     {
@@ -181,16 +181,9 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
         if (_topicArns.TryGetValue(topicName, out string arn))
             return arn;
 
-        using (await _lock.LockAsync(cancellationToken).AnyContext())
-        {
-            // Double-check after acquiring lock
-            if (_topicArns.TryGetValue(topicName, out arn))
-                return arn;
-
-            arn = await CreateTopicImplAsync(topicName, cancellationToken).AnyContext();
-            _topicArns[topicName] = arn;
-            return arn;
-        }
+        arn = await CreateTopicImplAsync(topicName, cancellationToken).AnyContext();
+        _topicArns.TryAdd(topicName, arn);
+        return arn;
     }
 
     /// <summary>
