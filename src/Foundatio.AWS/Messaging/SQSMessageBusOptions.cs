@@ -76,6 +76,13 @@ public class SQSMessageBusOptions : SharedMessageBusOptions
     /// The KMS data key reuse period in seconds. Default is 300 seconds (5 minutes).
     /// </summary>
     public int KmsDataKeyReusePeriodSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// Optional function to resolve the SNS topic name for a given message type.
+    /// If not set or returns null, falls back to the default <see cref="SharedMessageBusOptions.Topic"/>.
+    /// This enables routing different message types to different SNS topics.
+    /// </summary>
+    public Func<Type, string> TopicResolver { get; set; }
 }
 
 public class SQSMessageBusOptionsBuilder : SharedMessageBusOptionsBuilder<SQSMessageBusOptions, SQSMessageBusOptionsBuilder>
@@ -243,6 +250,20 @@ public class SQSMessageBusOptionsBuilder : SharedMessageBusOptionsBuilder<SQSMes
     {
         Target.SqsManagedSseEnabled = true;
         Target.KmsMasterKeyId = null;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets a function to resolve the SNS topic name for a given message type.
+    /// This enables routing different message types to different SNS topics.
+    /// </summary>
+    /// <param name="resolver">
+    /// A function that takes a message type and returns the topic name.
+    /// Return null to use the default topic.
+    /// </param>
+    public SQSMessageBusOptionsBuilder TopicResolver(Func<Type, string> resolver)
+    {
+        Target.TopicResolver = resolver;
         return this;
     }
 

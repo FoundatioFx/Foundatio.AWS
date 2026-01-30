@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -64,7 +65,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
     private readonly AsyncLock _lock = new();
     private readonly Lazy<AmazonSimpleNotificationServiceClient> _snsClient;
     private readonly Lazy<AmazonSQSClient> _sqsClient;
-    private string _topicArn;
+    private readonly ConcurrentDictionary<string, string> _topicArns = new();
     private string _queueUrl;
     private string _queueArn;
     private string _subscriptionArn;
@@ -147,61 +148,97 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
     /// </remarks>
     protected override async Task EnsureTopicCreatedAsync(CancellationToken cancellationToken)
     {
-        if (!String.IsNullOrEmpty(_topicArn))
-            return;
+        await GetOrCreateTopicArnAsync(_options.Topic, cancellationToken).AnyContext();
+    }
+
+    /// <summary>
+    /// Gets the topic name for a given message type using the configured TopicResolver.
+    /// </summary>
+    /// <param name="messageType">The CLR type of the message.</param>
+    /// <returns>The resolved topic name, or the default topic if no resolver is configured or it returns null.</returns>
+    private string GetTopicName(Type messageType)
+    {
+        if (_options.TopicResolver is null)
+            return _options.Topic;
+
+        return _options.TopicResolver(messageType) ?? _options.Topic;
+    }
+
+    /// <summary>
+    /// Gets or creates the SNS topic ARN for the specified topic name, with memoization.
+    /// </summary>
+    /// <param name="topicName">The name of the SNS topic.</param>
+    /// <param name="cancellationToken">A cancellation token.</param>
+    /// <returns>The ARN of the SNS topic.</returns>
+    /// <remarks>
+    /// This method uses double-check locking to ensure thread-safe topic creation.
+    /// Topic ARNs are cached in a ConcurrentDictionary to avoid redundant AWS API calls.
+    /// </remarks>
+    private async Task<string> GetOrCreateTopicArnAsync(string topicName, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(topicName, nameof(topicName));
+
+        if (_topicArns.TryGetValue(topicName, out string arn))
+            return arn;
 
         using (await _lock.LockAsync(cancellationToken).AnyContext())
         {
-            await EnsureTopicCreatedImplAsync(cancellationToken).AnyContext();
+            // Double-check after acquiring lock
+            if (_topicArns.TryGetValue(topicName, out arn))
+                return arn;
+
+            arn = await CreateTopicImplAsync(topicName, cancellationToken).AnyContext();
+            _topicArns[topicName] = arn;
+            return arn;
         }
     }
 
     /// <summary>
     /// Internal implementation of topic creation. Caller must hold the lock.
     /// </summary>
-    private async Task EnsureTopicCreatedImplAsync(CancellationToken cancellationToken)
+    private async Task<string> CreateTopicImplAsync(string topicName, CancellationToken cancellationToken)
     {
-        if (!String.IsNullOrEmpty(_topicArn))
-            return;
-
-        _logger.LogTrace("Ensuring SNS topic {Topic} exists", _options.Topic);
-
-        try
-        {
-            var findResponse = await _snsClient.Value.FindTopicAsync(_options.Topic).AnyContext();
-            if (findResponse?.TopicArn is not null)
-            {
-                _topicArn = findResponse.TopicArn;
-                _logger.LogDebug("Found existing SNS topic {Topic} with ARN {TopicArn}", _options.Topic, _topicArn);
-                return;
-            }
-        }
-        catch (SnsNotFoundException)
-        {
-            _logger.LogTrace("Topic {Topic} not found, will create", _options.Topic);
-        }
-        catch (AmazonServiceException ex)
-        {
-            // Log as warning since this is an unexpected AWS error, not just "not found"
-            _logger.LogWarning(ex, "Error finding topic {Topic}, will attempt to create", _options.Topic);
-        }
+        _logger.LogTrace("Ensuring SNS topic {Topic} exists", topicName);
 
         if (!_options.CanCreateTopic)
-            throw new MessageBusException($"Topic {_options.Topic} does not exist and CanCreateTopic is false.");
+        {
+            // Only check if topic exists when we can't create it
+            try
+            {
+                var findResponse = await _snsClient.Value.FindTopicAsync(topicName).AnyContext();
+                if (findResponse?.TopicArn is not null)
+                {
+                    _logger.LogDebug("Found existing SNS topic {Topic} with ARN {TopicArn}", topicName, findResponse.TopicArn);
+                    return findResponse.TopicArn;
+                }
+            }
+            catch (SnsNotFoundException)
+            {
+                // Topic not found and we can't create it
+            }
+            catch (AmazonServiceException ex)
+            {
+                _logger.LogWarning(ex, "Error finding topic {Topic}", topicName);
+            }
 
+            throw new MessageBusException($"Topic {topicName} does not exist and CanCreateTopic is false.");
+        }
+
+        // CreateTopicAsync is idempotent - if topic exists, it returns the existing ARN
+        // This is much faster than FindTopicAsync which lists all topics
         try
         {
             var createResponse = await _snsClient.Value.CreateTopicAsync(new CreateTopicRequest
             {
-                Name = _options.Topic
+                Name = topicName
             }, cancellationToken).AnyContext();
 
-            _topicArn = createResponse.TopicArn;
-            _logger.LogDebug("Created SNS topic {Topic} with ARN {TopicArn}", _options.Topic, _topicArn);
+            _logger.LogDebug("Ensured SNS topic {Topic} exists with ARN {TopicArn}", topicName, createResponse.TopicArn);
+            return createResponse.TopicArn;
         }
         catch (AmazonServiceException ex)
         {
-            throw new MessageBusException($"Failed to create SNS topic {_options.Topic}: {ex.Message}", ex);
+            throw new MessageBusException($"Failed to create SNS topic {topicName}: {ex.Message}", ex);
         }
     }
 
@@ -241,9 +278,8 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             if (_subscriberTask is not null)
                 return;
 
-            // Ensure topic exists inside the lock to avoid race conditions
-            if (String.IsNullOrEmpty(_topicArn))
-                await EnsureTopicCreatedImplAsync(cancellationToken).AnyContext();
+            // Get or create the default topic for subscription
+            string topicArn = await GetOrCreateTopicArnAsync(_options.Topic, cancellationToken).AnyContext();
 
             string queueName = GetSubscriptionQueueName();
             _logger.LogTrace("Ensuring SQS queue {QueueName} exists for subscription", queueName);
@@ -307,12 +343,12 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
                 _queueArn = getAttributesResponse.QueueARN;
 
                 // Check if policy already allows this SNS topic
-                string expectedSid = $"AllowSNS-{_topicArn.GetHashCode():X8}";
+                string expectedSid = $"AllowSNS-{topicArn.GetHashCode():X8}";
                 bool policyNeedsUpdate = !PolicyContainsStatement(getAttributesResponse.Policy, expectedSid);
 
                 if (policyNeedsUpdate)
                 {
-                    string policy = GetMergedQueuePolicy(getAttributesResponse.Policy, _queueArn, _topicArn);
+                    string policy = GetMergedQueuePolicy(getAttributesResponse.Policy, _queueArn, topicArn);
 
                     await _sqsClient.Value.SetQueueAttributesAsync(new SetQueueAttributesRequest
                     {
@@ -323,12 +359,12 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
                         }
                     }, cancellationToken).AnyContext();
 
-                    _logger.LogDebug("Updated SQS queue policy to allow SNS topic {TopicArn}", _topicArn);
+                    _logger.LogDebug("Updated SQS queue policy to allow SNS topic {TopicArn}", topicArn);
                 }
 
                 var subscribeResponse = await _snsClient.Value.SubscribeAsync(new SubscribeRequest
                 {
-                    TopicArn = _topicArn,
+                    TopicArn = topicArn,
                     Protocol = "sqs",
                     Endpoint = _queueArn,
                     Attributes = new Dictionary<string, string>
@@ -338,7 +374,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
                 }, cancellationToken).AnyContext();
 
                 _subscriptionArn = subscribeResponse.SubscriptionArn;
-                _logger.LogDebug("Subscribed SQS queue {QueueArn} to SNS topic {TopicArn} with subscription {SubscriptionArn}", _queueArn, _topicArn, _subscriptionArn);
+                _logger.LogDebug("Subscribed SQS queue {QueueArn} to SNS topic {TopicArn} with subscription {SubscriptionArn}", _queueArn, topicArn, _subscriptionArn);
 
                 _subscriberCts = CancellationTokenSource.CreateLinkedTokenSource(DisposedCancellationToken);
                 _subscriberTask = Task.Run(() => SubscriberLoopAsync(_subscriberCts.Token), _subscriberCts.Token);
@@ -588,12 +624,17 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             return;
         }
 
-        _logger.LogTrace("Publishing message: {MessageType}", messageType);
+        // Resolve the topic name based on message type
+        Type clrMessageType = GetMappedMessageType(messageType);
+        string topicName = clrMessageType is not null ? GetTopicName(clrMessageType) : _options.Topic;
+        string topicArn = await GetOrCreateTopicArnAsync(topicName, cancellationToken).AnyContext();
+
+        _logger.LogTrace("Publishing message: {MessageType} to topic {Topic}", messageType, topicName);
 
         string messageBody = _serializer.SerializeToString(message);
         var publishRequest = new PublishRequest
         {
-            TopicArn = _topicArn,
+            TopicArn = topicArn,
             Message = messageBody,
             MessageAttributes = new Dictionary<string, SnsMessageAttributeValue>
             {
@@ -643,11 +684,11 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             }
             catch (SnsNotFoundException ex)
             {
-                throw new MessageBusException($"SNS topic {_options.Topic} not found: {ex.Message}", ex);
+                throw new MessageBusException($"SNS topic {topicName} not found: {ex.Message}", ex);
             }
             catch (AmazonServiceException ex)
             {
-                throw new MessageBusException($"Failed to publish message to SNS topic {_options.Topic}: {ex.Message}", ex);
+                throw new MessageBusException($"Failed to publish message to SNS topic {topicName}: {ex.Message}", ex);
             }
         }, cancellationToken).AnyContext();
     }
