@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Threading;
@@ -398,7 +399,10 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
                 {
                     await _subscriberTask.AnyContext();
                 }
-                catch (OperationCanceledException) { }
+                catch (OperationCanceledException)
+                {
+                    // Expected when the subscriber is canceled during shutdown
+                }
                 _subscriberTask = null;
             }
 
@@ -524,7 +528,6 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in subscriber loop: {Message}", ex.Message);
-
                 if (cancellationToken.IsCancellationRequested)
                     break;
 
@@ -700,7 +703,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             }
             catch (OperationCanceledException)
             {
-                // Ignored
+                // Expected when the subscriber is canceled during shutdown
             }
         }
 
@@ -712,9 +715,13 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             {
                 await _snsClient.Value.UnsubscribeAsync(_subscriptionArn).AnyContext();
             }
-            catch
+            catch (SnsNotFoundException)
             {
-                // Ignored
+                // Subscription already deleted
+            }
+            catch (AmazonServiceException ex)
+            {
+                _logger.LogDebug(ex, "Error unsubscribing from SNS topic during dispose");
             }
         }
 
@@ -724,9 +731,13 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             {
                 await _sqsClient.Value.DeleteQueueAsync(_queueUrl).AnyContext();
             }
-            catch
+            catch (QueueDoesNotExistException)
             {
-                // Ignored
+                // Queue already deleted
+            }
+            catch (AmazonServiceException ex)
+            {
+                _logger.LogDebug(ex, "Error deleting SQS queue during dispose");
             }
         }
 
@@ -764,11 +775,9 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
         if (name.Length > 80)
             throw new ArgumentException($"Queue name must be 80 characters or less, got {name.Length} characters.", parameterName);
 
-        foreach (char c in name)
-        {
-            if (!Char.IsLetterOrDigit(c) && c != '-' && c != '_')
-                throw new ArgumentException($"Queue name contains invalid character '{c}'. Only alphanumeric characters, hyphens, and underscores are allowed.", parameterName);
-        }
+        char invalidChar = name.FirstOrDefault(c => !Char.IsLetterOrDigit(c) && c != '-' && c != '_');
+        if (invalidChar != default)
+            throw new ArgumentException($"Queue name contains invalid character '{invalidChar}'. Only alphanumeric characters, hyphens, and underscores are allowed.", parameterName);
     }
 
     /// <summary>
@@ -818,12 +827,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             if (statements is null)
                 return false;
 
-            foreach (var stmt in statements)
-            {
-                string stmtSid = stmt?.AsObject()?["Sid"]?.GetValue<string>();
-                if (stmtSid == sid)
-                    return true;
-            }
+            return statements.Any(stmt => stmt?.AsObject()?["Sid"]?.GetValue<string>() == sid);
         }
         catch
         {

@@ -454,9 +454,9 @@ public class SQSMessageBusTests : MessageBusTestBase
 
         // Assert - TopicResolver was called multiple times but topic should only be created once
         // The memoization in GetOrCreateTopicArnAsync ensures the actual AWS CreateTopic is called once
-        Assert.True(topicCreationCount.ContainsKey("routed-TopicAMessage"));
+        Assert.True(topicCreationCount.TryGetValue("routed-TopicAMessage", out int creationCount));
         // The resolver is called for each publish, but the underlying topic creation is memoized
-        Assert.True(topicCreationCount["routed-TopicAMessage"] >= 1);
+        Assert.True(creationCount >= 1);
     }
 
     [Fact]
@@ -483,8 +483,8 @@ public class SQSMessageBusTests : MessageBusTestBase
         }
 
         // Assert - Resolver was called for each publish
-        Assert.True(resolverCallCount.ContainsKey(typeof(TopicAMessage)));
-        Assert.Equal(5, resolverCallCount[typeof(TopicAMessage)]);
+        Assert.True(resolverCallCount.TryGetValue(typeof(TopicAMessage), out int callCount));
+        Assert.Equal(5, callCount);
         // The memoization happens at the topic ARN level, not the resolver level
         // This test verifies the resolver is called but the underlying topic creation is cached
     }
