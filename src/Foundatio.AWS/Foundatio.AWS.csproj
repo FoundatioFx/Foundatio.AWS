@@ -5,7 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="AWSSDK.CloudWatch" Version="4.0.8.1" />
-    <PackageReference Include="AWSSDK.S3" Version="4.0.18.8" />
+    <PackageReference Include="AWSSDK.S3" Version="4.0.19" />
     <PackageReference Include="AWSSDK.SimpleNotificationService" Version="4.0.2.18" />
     <PackageReference Include="AWSSDK.SQS" Version="4.0.2.16" />
 
