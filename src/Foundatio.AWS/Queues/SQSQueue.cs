@@ -213,7 +213,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             _logger.LogWarning(deserializeException, "Error deserializing message {MessageId} (receive count {ReceiveCount}), abandoning for retry",
                 message.MessageId, message.ApproximateReceiveCount());
 
-            var poisonEntry = new SQSQueueEntry<T>(message, default, this);
+            var poisonEntry = new SQSQueueEntry<T>(message, null, this);
             await AbandonAsync(poisonEntry).AnyContext();
             return null;
         }

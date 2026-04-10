@@ -149,7 +149,7 @@ public class S3FileStorage : IFileStorage
 
             var fileSpec = new FileSpec
             {
-                Path = req.Key ?? path,
+                Path = path,
                 Size = response.ContentLength,
                 Created = response.LastModified?.ToUniversalTime() ?? DateTime.MinValue, // TODO: Need to fix this
                 Modified = response.LastModified?.ToUniversalTime() ?? DateTime.MinValue
@@ -473,7 +473,7 @@ public class S3FileStorage : IFileStorage
 
         _logger.LogTrace(
             s => s.Property("Limit", req.MaxKeys),
-            "Getting file list matching {Prefix} and {Pattern}...", criteria.Prefix, (object?)criteria.Pattern ?? "null"
+            "Getting file list matching {Prefix} and {Pattern}...", criteria.Prefix, criteria.Pattern
         );
 
         var response = await _client.ListObjectsV2Async(req, cancellationToken).AnyContext();
@@ -481,7 +481,11 @@ public class S3FileStorage : IFileStorage
         {
             Success = response.HttpStatusCode.IsSuccessful(),
             HasMore = response.IsTruncated.GetValueOrDefault(),
-            Files = response.S3Objects?.MatchesPattern(criteria.Pattern).Select(blob => blob.ToFileInfo()).Where(spec => spec is not null && !spec.IsDirectory()).Cast<FileSpec>().ToList() ?? [],
+            Files = response.S3Objects?.MatchesPattern(criteria.Pattern)
+                .Select(blob => blob.ToFileInfo())
+                .OfType<FileSpec>()
+                .Where(spec => !spec.IsDirectory())
+                .ToList() ?? [],
             NextPageFunc = response.IsTruncated.GetValueOrDefault() ? _ => GetFiles(criteria, pageSize, cancellationToken, response.NextContinuationToken) : null
         };
     }
@@ -502,7 +506,7 @@ public class S3FileStorage : IFileStorage
         if (String.IsNullOrEmpty(searchPattern))
             return new SearchCriteria { Prefix = String.Empty };
 
-        string normalizedSearchPattern = NormalizePath(searchPattern) ?? String.Empty;
+        string normalizedSearchPattern = searchPattern.Replace('\\', '/');
         int wildcardPos = normalizedSearchPattern.IndexOf('*');
         bool hasWildcard = wildcardPos >= 0;
 

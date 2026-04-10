@@ -559,12 +559,6 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             }
         }
 
-        if (String.IsNullOrEmpty(messageType))
-        {
-            _logger.LogWarning("Message {MessageId} missing MessageType attribute, skipping", sqsMessage.MessageId);
-            return;
-        }
-
         string body = sqsMessage.Body;
         Type? clrType = GetMappedMessageType(messageType);
         byte[] bodyData = String.IsNullOrEmpty(body) ? [] : Encoding.UTF8.GetBytes(body);
