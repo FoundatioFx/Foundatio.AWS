@@ -564,7 +564,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
         byte[] bodyData = String.IsNullOrEmpty(body) ? [] : Encoding.UTF8.GetBytes(body);
         var message = new Message(bodyData, DeserializeMessageBody)
         {
-            Type = messageType ?? string.Empty,
+            Type = messageType ?? String.Empty,
             ClrType = clrType,
             CorrelationId = correlationId,
             UniqueId = uniqueId
