@@ -92,7 +92,7 @@ public class SQSMessageBusOptionsBuilder : SharedMessageBusOptionsBuilder<SQSMes
     /// </summary>
     public SQSMessageBusOptionsBuilder ConnectionString(string connectionString)
     {
-        ArgumentException.ThrowIfNullOrEmpty(connectionString);
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         Target.ConnectionString = connectionString;
         return this;
     }
