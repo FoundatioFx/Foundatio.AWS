@@ -583,7 +583,10 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
         {
             _logger.LogTrace("Scheduling delayed message: {MessageType} ({Delay}ms)", messageType, options.DeliveryDelay.Value.TotalMilliseconds);
             if (clrMessageType is null)
-                throw new MessageBusException($"Unable to resolve CLR type for delayed message: {messageType}");
+            {
+                _logger.LogWarning("Cannot schedule delayed message: unable to resolve CLR type for {MessageType}", messageType);
+                return;
+            }
 
             SendDelayedMessage(clrMessageType, message, options);
             return;

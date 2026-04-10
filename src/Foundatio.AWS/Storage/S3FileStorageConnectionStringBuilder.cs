@@ -66,8 +66,8 @@ public class S3FileStorageConnectionStringBuilder : AmazonConnectionStringBuilde
             connectionString += "UseChunkEncoding=" + UseChunkEncoding + ";";
         if (!String.IsNullOrEmpty(ServiceUrl))
             connectionString += "ServiceUrl=" + ServiceUrl + ";";
-        if (!String.IsNullOrEmpty(CannedACL))
-            connectionString += "CannedACL=" + CannedACL + ";";
+        if (!String.IsNullOrEmpty(_cannedAcl))
+            connectionString += "CannedACL=" + _cannedAcl + ";";
 
         return connectionString;
     }

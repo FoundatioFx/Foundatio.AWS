@@ -41,7 +41,7 @@ public abstract class AmazonConnectionStringBuilder
 
     public AWSCredentials? GetCredentials()
     {
-        return !String.IsNullOrEmpty(AccessKey)
+        return !String.IsNullOrEmpty(AccessKey) && !String.IsNullOrEmpty(SecretKey)
             ? new BasicAWSCredentials(AccessKey, SecretKey)
             : null;
     }
