@@ -19,7 +19,9 @@ public static class SQSMessageBusServiceCollectionExtensions
         services.AddSingleton<IMessageBus>(sp =>
         {
             var builder = new SQSMessageBusOptionsBuilder();
-            builder.LoggerFactory(sp.GetService<ILoggerFactory>());
+            var loggerFactory = sp.GetService<ILoggerFactory>();
+            if (loggerFactory is not null)
+                builder.LoggerFactory(loggerFactory);
             configure(builder);
             return new SQSMessageBus(builder.Build());
         });
@@ -36,7 +38,7 @@ public static class SQSMessageBusServiceCollectionExtensions
     public static IServiceCollection AddSQSMessageBus(
         this IServiceCollection services,
         string connectionString,
-        Action<SQSMessageBusOptionsBuilder> configure = null)
+        Action<SQSMessageBusOptionsBuilder>? configure = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(connectionString);
 

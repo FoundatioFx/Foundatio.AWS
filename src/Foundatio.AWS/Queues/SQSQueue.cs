@@ -19,8 +19,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 {
     private readonly AsyncLock _lock = new();
     private readonly Lazy<AmazonSQSClient> _client;
-    private string _queueUrl;
-    private string _deadUrl;
+    private string? _queueUrl;
+    private string? _deadUrl;
 
     private long _enqueuedCount;
     private long _dequeuedCount;
@@ -84,7 +84,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         }
     }
 
-    protected override async Task<string> EnqueueImplAsync(T data, QueueEntryOptions options)
+    protected override async Task<string?> EnqueueImplAsync(T data, QueueEntryOptions options)
     {
         if (!await OnEnqueuingAsync(data, options).AnyContext())
             return null;
@@ -136,7 +136,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         return response.MessageId;
     }
 
-    protected override async Task<IQueueEntry<T>> DequeueImplAsync(CancellationToken linkedCancellationToken)
+    protected override async Task<IQueueEntry<T>?> DequeueImplAsync(CancellationToken linkedCancellationToken)
     {
         // sqs doesn't support already canceled token, change timeout and token for sqs pattern
         int visibilityTimeout = (int)Math.Round(_options.WorkItemTimeout.TotalSeconds, MidpointRounding.AwayFromZero);
@@ -196,7 +196,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         var message = response.Messages[0];
         string body = message.Body;
 
-        T data;
+        T? data;
         try
         {
             data = _serializer.Deserialize<T>(body);
@@ -206,7 +206,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             _logger.LogWarning(ex, "Error deserializing message {MessageId} (receive count {ReceiveCount}), abandoning for retry",
                 message.MessageId, message.ApproximateReceiveCount());
 
-            var poisonEntry = new SQSQueueEntry<T>(message, null, this);
+            var poisonEntry = new SQSQueueEntry<T>(message, null!, this);
             await AbandonAsync(poisonEntry).AnyContext();
             return null;
         }
@@ -349,7 +349,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         // lookup dead letter url
         if (String.IsNullOrEmpty(_deadUrl))
         {
-            string deadLetterName = queueAttributes.Attributes.DeadLetterQueue();
+            string? deadLetterName = queueAttributes.Attributes.DeadLetterQueue();
             if (!String.IsNullOrEmpty(deadLetterName))
             {
                 var deadResponse = await _client.Value.GetQueueUrlAsync(deadLetterName).AnyContext();
@@ -412,7 +412,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             {
                 _logger.LogTrace("WorkerLoop Signaled {QueueName}", _options.Name);
 
-                IQueueEntry<T> entry = null;
+                IQueueEntry<T>? entry = null;
                 try
                 {
                     entry = await DequeueImplAsync(linkedCancellationTokenSource.Token).AnyContext();

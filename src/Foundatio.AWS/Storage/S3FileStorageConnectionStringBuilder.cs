@@ -5,9 +5,9 @@ namespace Foundatio.Storage;
 
 public class S3FileStorageConnectionStringBuilder : AmazonConnectionStringBuilder
 {
-    private string _bucket;
-    private string _useChunkEncoding;
-    private string _cannedAcl;
+    private string? _bucket;
+    private string? _useChunkEncoding;
+    private string? _cannedAcl;
 
     public S3FileStorageConnectionStringBuilder()
     {
@@ -29,10 +29,10 @@ public class S3FileStorageConnectionStringBuilder : AmazonConnectionStringBuilde
         set => _useChunkEncoding = value.ToString();
     }
 
-    public S3CannedACL CannedACL
+    public S3CannedACL? CannedACL
     {
         get => String.IsNullOrEmpty(_cannedAcl) ? null : S3CannedACL.FindValue(_cannedAcl);
-        set => _cannedAcl = value.Value;
+        set => _cannedAcl = value?.Value;
     }
 
     protected override bool ParseItem(string key, string value)

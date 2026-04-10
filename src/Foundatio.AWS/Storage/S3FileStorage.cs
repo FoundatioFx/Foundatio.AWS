@@ -26,7 +26,7 @@ public class S3FileStorage : IFileStorage
     private readonly ISerializer _serializer;
     private readonly AmazonS3Client _client;
     private readonly bool _useChunkEncoding;
-    private readonly S3CannedACL _cannedAcl;
+    private readonly S3CannedACL? _cannedAcl;
     private readonly bool _allowInMemoryStream;
     private readonly ILogger _logger;
 
@@ -38,6 +38,7 @@ public class S3FileStorage : IFileStorage
         _serializer = options.Serializer ?? DefaultSerializer.Instance;
         _logger = options.LoggerFactory?.CreateLogger(GetType()) ?? NullLogger.Instance;
 
+        ArgumentException.ThrowIfNullOrEmpty(options.Bucket);
         _bucket = options.Bucket;
         _useChunkEncoding = options.UseChunkEncoding ?? true;
         _cannedAcl = options.CannedACL;
@@ -69,13 +70,13 @@ public class S3FileStorage : IFileStorage
 
     public AmazonS3Client Client => _client;
     public string Bucket => _bucket;
-    public S3CannedACL CannedACL => _cannedAcl;
+    public S3CannedACL? CannedACL => _cannedAcl;
 
     [Obsolete($"Use {nameof(GetFileStreamAsync)} with {nameof(FileAccess)} instead to define read or write behaviour of stream")]
-    public Task<Stream> GetFileStreamAsync(string path, CancellationToken cancellationToken = default)
+    public Task<Stream?> GetFileStreamAsync(string path, CancellationToken cancellationToken = default)
         => GetFileStreamAsync(path, StreamMode.Read, cancellationToken);
 
-    public async Task<Stream> GetFileStreamAsync(string path, StreamMode streamMode, CancellationToken cancellationToken = default)
+    public async Task<Stream?> GetFileStreamAsync(string path, StreamMode streamMode, CancellationToken cancellationToken = default)
     {
         if (String.IsNullOrEmpty(path))
             throw new ArgumentNullException(nameof(path));
@@ -122,7 +123,7 @@ public class S3FileStorage : IFileStorage
         });
     }
 
-    public async Task<FileSpec> GetFileInfoAsync(string path)
+    public async Task<FileSpec?> GetFileInfoAsync(string path)
     {
         if (String.IsNullOrEmpty(path))
             throw new ArgumentNullException(nameof(path));
@@ -158,7 +159,7 @@ public class S3FileStorage : IFileStorage
             if (response.AcceptRanges is not null)
                 fileSpec.Data[nameof(response.AcceptRanges)] = response.AcceptRanges;
             if (response.ArchiveStatus is not null)
-                fileSpec.Data[nameof(response.ArchiveStatus)] = response.ArchiveStatus?.ToString();
+                fileSpec.Data[nameof(response.ArchiveStatus)] = response.ArchiveStatus.ToString();
             if (response.BucketKeyEnabled.HasValue)
                 fileSpec.Data[nameof(response.BucketKeyEnabled)] = response.BucketKeyEnabled.Value;
             if (response.ChecksumCRC32 is not null)
@@ -400,7 +401,7 @@ public class S3FileStorage : IFileStorage
         return response.HttpStatusCode.IsSuccessful();
     }
 
-    public async Task<int> DeleteFilesAsync(string searchPattern = null, CancellationToken cancellationToken = new CancellationToken())
+    public async Task<int> DeleteFilesAsync(string? searchPattern = null, CancellationToken cancellationToken = new CancellationToken())
     {
         var criteria = GetRequestCriteria(searchPattern);
         int count = 0;
@@ -449,7 +450,7 @@ public class S3FileStorage : IFileStorage
         return count;
     }
 
-    public async Task<PagedFileListResult> GetPagedFileListAsync(int pageSize = 100, string searchPattern = null, CancellationToken cancellationToken = default)
+    public async Task<PagedFileListResult> GetPagedFileListAsync(int pageSize = 100, string? searchPattern = null, CancellationToken cancellationToken = default)
     {
         if (pageSize <= 0)
             return PagedFileListResult.Empty;
@@ -461,7 +462,7 @@ public class S3FileStorage : IFileStorage
         return result;
     }
 
-    private async Task<NextPageResult> GetFiles(SearchCriteria criteria, int pageSize, CancellationToken cancellationToken, string continuationToken = null)
+    private async Task<NextPageResult> GetFiles(SearchCriteria criteria, int pageSize, CancellationToken cancellationToken, string? continuationToken = null)
     {
         var req = new ListObjectsV2Request
         {
@@ -473,7 +474,7 @@ public class S3FileStorage : IFileStorage
 
         _logger.LogTrace(
             s => s.Property("Limit", req.MaxKeys),
-            "Getting file list matching {Prefix} and {Pattern}...", criteria.Prefix, criteria.Pattern
+            "Getting file list matching {Prefix} and {Pattern}...", criteria.Prefix, (object?)criteria.Pattern ?? "null"
         );
 
         var response = await _client.ListObjectsV2Async(req, cancellationToken).AnyContext();
@@ -481,23 +482,23 @@ public class S3FileStorage : IFileStorage
         {
             Success = response.HttpStatusCode.IsSuccessful(),
             HasMore = response.IsTruncated.GetValueOrDefault(),
-            Files = response.S3Objects?.MatchesPattern(criteria.Pattern).Select(blob => blob.ToFileInfo()).Where(spec => spec is not null && !spec.IsDirectory()).ToList() ?? [],
+            Files = response.S3Objects?.MatchesPattern(criteria.Pattern).Select(blob => blob.ToFileInfo()).Where(spec => spec is not null && !spec.IsDirectory()).Cast<FileSpec>().ToList() ?? [],
             NextPageFunc = response.IsTruncated.GetValueOrDefault() ? _ => GetFiles(criteria, pageSize, cancellationToken, response.NextContinuationToken) : null
         };
     }
 
     private string NormalizePath(string path)
     {
-        return path?.Replace('\\', '/');
+        return path.Replace('\\', '/');
     }
 
     private class SearchCriteria
     {
-        public string Prefix { get; set; }
-        public Regex Pattern { get; set; }
+        public string Prefix { get; set; } = "";
+        public Regex? Pattern { get; set; }
     }
 
-    private SearchCriteria GetRequestCriteria(string searchPattern)
+    private SearchCriteria GetRequestCriteria(string? searchPattern)
     {
         if (String.IsNullOrEmpty(searchPattern))
             return new SearchCriteria { Prefix = String.Empty };
@@ -507,7 +508,7 @@ public class S3FileStorage : IFileStorage
         bool hasWildcard = wildcardPos >= 0;
 
         string prefix = normalizedSearchPattern;
-        Regex patternRegex = null;
+        Regex? patternRegex = null;
 
         if (hasWildcard)
         {
