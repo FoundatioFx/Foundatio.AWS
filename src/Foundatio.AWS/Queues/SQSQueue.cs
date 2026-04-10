@@ -125,7 +125,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         var response = await _client.Value.SendMessageAsync(message).AnyContext();
         if (response.HttpStatusCode != System.Net.HttpStatusCode.OK)
-            throw new InvalidOperationException("Failed to send SQS message.");
+            throw new QueueException("Failed to send SQS message.");
 
         _logger.LogTrace("Enqueued SQS message {MessageId}", response.MessageId);
 
@@ -197,13 +197,20 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         string body = message.Body;
 
         T? data;
+        Exception? deserializeException = null;
         try
         {
             data = _serializer.Deserialize<T>(body);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Error deserializing message {MessageId} (receive count {ReceiveCount}), abandoning for retry",
+            data = null;
+            deserializeException = ex;
+        }
+
+        if (data is null)
+        {
+            _logger.LogWarning(deserializeException, "Error deserializing message {MessageId} (receive count {ReceiveCount}), abandoning for retry",
                 message.MessageId, message.ApproximateReceiveCount());
 
             var poisonEntry = new SQSQueueEntry<T>(message, default, this);
@@ -248,7 +255,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     {
         _logger.LogDebug("Queue {QueueName} complete item: {QueueEntryId}", _options.Name, queueEntry.Id);
         if (queueEntry.IsAbandoned || queueEntry.IsCompleted)
-            throw new InvalidOperationException("Queue entry has already been completed or abandoned.");
+            throw new QueueException("Queue entry has already been completed or abandoned.");
 
         var entry = ToQueueEntry(queueEntry);
         var request = new DeleteMessageRequest
@@ -270,7 +277,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         _logger.LogDebug("Queue {QueueName} ({QueueId}) abandon item: {QueueEntryId}", _options.Name, QueueId, entry.Id);
 
         if (entry.IsAbandoned || entry.IsCompleted)
-            throw new InvalidOperationException("Queue entry has already been completed or abandoned.");
+            throw new QueueException("Queue entry has already been completed or abandoned.");
 
         var sqsQueueEntry = ToQueueEntry(entry);
 

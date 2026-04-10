@@ -128,7 +128,7 @@ public class SQSQueueOptionsBuilder<T> : SharedQueueOptionsBuilder<T, SQSQueueOp
     public SQSQueueOptionsBuilder<T> UseSqsManagedEncryption()
     {
         Target.SqsManagedSseEnabled = true;
-        Target.KmsMasterKeyId = null;
+        Target.KmsMasterKeyId = null; // Must set KmsMasterKeyId to null, as it is either KMS or Sqs Managed - can't have both
         return this;
     }
 

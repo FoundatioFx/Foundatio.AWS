@@ -539,7 +539,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
 
         _logger.LogTrace("Processing message {MessageId}", sqsMessage.MessageId);
 
-        string? messageType = null;
+        string messageType = String.Empty;
         string? correlationId = null;
         string uniqueId = sqsMessage.MessageId;
         var properties = new Dictionary<string, string>();
@@ -560,11 +560,11 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
         }
 
         string body = sqsMessage.Body;
-        Type? clrType = messageType is not null ? GetMappedMessageType(messageType) : null;
+        Type? clrType = !String.IsNullOrEmpty(messageType) ? GetMappedMessageType(messageType) : null;
         byte[] bodyData = String.IsNullOrEmpty(body) ? [] : Encoding.UTF8.GetBytes(body);
         var message = new Message(bodyData, DeserializeMessageBody)
         {
-            Type = messageType ?? String.Empty,
+            Type = messageType,
             ClrType = clrType,
             CorrelationId = correlationId,
             UniqueId = uniqueId
@@ -582,11 +582,8 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
         if (options.DeliveryDelay.HasValue && options.DeliveryDelay.Value > TimeSpan.Zero)
         {
             _logger.LogTrace("Scheduling delayed message: {MessageType} ({Delay}ms)", messageType, options.DeliveryDelay.Value.TotalMilliseconds);
-            if (clrMessageType is null)
-            {
-                _logger.LogWarning("Cannot schedule delayed message: unable to resolve CLR type for {MessageType}", messageType);
-                return;
-            }
+        if (clrMessageType is null)
+            throw new MessageBusException($"Unable to resolve CLR type for delayed message: {messageType}");
 
             SendDelayedMessage(clrMessageType, message, options);
             return;

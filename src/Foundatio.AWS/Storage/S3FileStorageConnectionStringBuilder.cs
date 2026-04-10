@@ -26,7 +26,7 @@ public class S3FileStorageConnectionStringBuilder : AmazonConnectionStringBuilde
     public bool? UseChunkEncoding
     {
         get => String.IsNullOrEmpty(_useChunkEncoding) ? null : (bool?)Convert.ToBoolean(_useChunkEncoding);
-        set => _useChunkEncoding = value.ToString();
+        set => _useChunkEncoding = value.HasValue ? value.Value.ToString() : null;
     }
 
     public S3CannedACL? CannedACL

@@ -32,13 +32,12 @@ public class S3FileStorage : IFileStorage
 
     public S3FileStorage(S3FileStorageOptions options)
     {
-        if (options == null)
-            throw new ArgumentNullException(nameof(options));
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrEmpty(options.Bucket);
 
         _serializer = options.Serializer ?? DefaultSerializer.Instance;
         _logger = options.LoggerFactory?.CreateLogger(GetType()) ?? NullLogger.Instance;
 
-        ArgumentException.ThrowIfNullOrEmpty(options.Bucket);
         _bucket = options.Bucket;
         _useChunkEncoding = options.UseChunkEncoding ?? true;
         _cannedAcl = options.CannedACL;
@@ -492,9 +491,9 @@ public class S3FileStorage : IFileStorage
         return path.Replace('\\', '/');
     }
 
-    private class SearchCriteria
+    private record SearchCriteria
     {
-        public string Prefix { get; set; } = "";
+        public required string Prefix { get; set; }
         public Regex? Pattern { get; set; }
     }
 
