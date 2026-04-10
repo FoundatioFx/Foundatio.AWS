@@ -149,7 +149,7 @@ public class S3FileStorage : IFileStorage
 
             var fileSpec = new FileSpec
             {
-                Path = req.Key,
+                Path = req.Key ?? path,
                 Size = response.ContentLength,
                 Created = response.LastModified?.ToUniversalTime() ?? DateTime.MinValue, // TODO: Need to fix this
                 Modified = response.LastModified?.ToUniversalTime() ?? DateTime.MinValue
@@ -486,9 +486,9 @@ public class S3FileStorage : IFileStorage
         };
     }
 
-    private string NormalizePath(string path)
+    private string? NormalizePath(string? path)
     {
-        return path.Replace('\\', '/');
+        return path?.Replace('\\', '/');
     }
 
     private record SearchCriteria
@@ -502,7 +502,7 @@ public class S3FileStorage : IFileStorage
         if (String.IsNullOrEmpty(searchPattern))
             return new SearchCriteria { Prefix = String.Empty };
 
-        string normalizedSearchPattern = NormalizePath(searchPattern);
+        string normalizedSearchPattern = NormalizePath(searchPattern) ?? String.Empty;
         int wildcardPos = normalizedSearchPattern.IndexOf('*');
         bool hasWildcard = wildcardPos >= 0;
 
