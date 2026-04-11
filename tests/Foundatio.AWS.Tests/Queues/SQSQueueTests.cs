@@ -352,6 +352,7 @@ public class SQSQueueTests : QueueTestBase
             await queue.EnqueueAsync(new SimpleWorkItem { Data = "Hello" }, new QueueEntryOptions { DeliveryDelay = TimeSpan.FromSeconds(3) });
             var workItem = await queue.DequeueAsync(TimeSpan.FromSeconds(3));
             Assert.NotNull(workItem);
+            Assert.NotNull(workItem?.Value);
             Assert.Equal("Hello", workItem!.Value!.Data);
 
             if (_assertStats)
