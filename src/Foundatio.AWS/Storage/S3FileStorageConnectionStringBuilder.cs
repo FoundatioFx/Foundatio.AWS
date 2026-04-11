@@ -59,16 +59,16 @@ public class S3FileStorageConnectionStringBuilder : AmazonConnectionStringBuilde
 
     public override string ToString()
     {
-        string connectionString = base.ToString();
+        var sb = new System.Text.StringBuilder(base.ToString());
         if (!String.IsNullOrEmpty(_bucket))
-            connectionString += "Bucket=" + Bucket + ";";
+            sb.Append("Bucket=").Append(Bucket).Append(';');
         if (!String.IsNullOrEmpty(_useChunkEncoding))
-            connectionString += "UseChunkEncoding=" + UseChunkEncoding + ";";
+            sb.Append("UseChunkEncoding=").Append(UseChunkEncoding).Append(';');
         if (!String.IsNullOrEmpty(ServiceUrl))
-            connectionString += "ServiceUrl=" + ServiceUrl + ";";
+            sb.Append("ServiceUrl=").Append(ServiceUrl).Append(';');
         if (!String.IsNullOrEmpty(_cannedAcl))
-            connectionString += "CannedACL=" + _cannedAcl + ";";
+            sb.Append("CannedACL=").Append(_cannedAcl).Append(';');
 
-        return connectionString;
+        return sb.ToString();
     }
 }

@@ -149,7 +149,7 @@ public class S3FileStorage : IFileStorage
 
             var fileSpec = new FileSpec
             {
-                Path = path,
+                Path = req.Key,
                 Size = response.ContentLength,
                 Created = response.LastModified?.ToUniversalTime() ?? DateTime.MinValue, // TODO: Need to fix this
                 Modified = response.LastModified?.ToUniversalTime() ?? DateTime.MinValue
@@ -483,16 +483,16 @@ public class S3FileStorage : IFileStorage
             HasMore = response.IsTruncated.GetValueOrDefault(),
             Files = response.S3Objects?.MatchesPattern(criteria.Pattern)
                 .Select(blob => blob.ToFileInfo())
-                .OfType<FileSpec>()
-                .Where(spec => !spec.IsDirectory())
+                .Where(spec => spec is not null && !spec.IsDirectory())
+                .Select(spec => spec!)
                 .ToList() ?? [],
             NextPageFunc = response.IsTruncated.GetValueOrDefault() ? _ => GetFiles(criteria, pageSize, cancellationToken, response.NextContinuationToken) : null
         };
     }
 
-    private string? NormalizePath(string? path)
+    private string NormalizePath(string path)
     {
-        return path?.Replace('\\', '/');
+        return path.Replace('\\', '/');
     }
 
     private record SearchCriteria
@@ -506,7 +506,7 @@ public class S3FileStorage : IFileStorage
         if (String.IsNullOrEmpty(searchPattern))
             return new SearchCriteria { Prefix = String.Empty };
 
-        string normalizedSearchPattern = searchPattern.Replace('\\', '/');
+        string normalizedSearchPattern = NormalizePath(searchPattern);
         int wildcardPos = normalizedSearchPattern.IndexOf('*');
         bool hasWildcard = wildcardPos >= 0;
 
