@@ -559,6 +559,9 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>, IAsyncDisposa
             }
         }
 
+        if (String.IsNullOrEmpty(messageType))
+            throw new MessageBusException($"Message {sqsMessage.MessageId} is missing the required MessageType attribute.");
+
         string body = sqsMessage.Body;
         Type? clrType = GetMappedMessageType(messageType);
         byte[] bodyData = String.IsNullOrEmpty(body) ? [] : Encoding.UTF8.GetBytes(body);

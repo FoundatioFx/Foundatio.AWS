@@ -319,6 +319,7 @@ public class SQSQueueTests : QueueTestBase
             _logger.LogInformation("Second Dequeue Attempt");
             workItem = await queue.DequeueAsync(TimeSpan.FromSeconds(2));
             Assert.NotNull(workItem);
+            Assert.NotNull(workItem?.Value);
             Assert.Equal("Hello", workItem!.Value!.Data);
 
             if (_assertStats)
