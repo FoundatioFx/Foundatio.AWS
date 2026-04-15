@@ -387,8 +387,14 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
     {
         if (_subscriberCts is not null)
         {
-            try { await _subscriberCts.CancelAsync().AnyContext(); }
-            catch (ObjectDisposedException ex) { _logger.LogTrace(ex, "Subscriber CTS already disposed during cleanup"); }
+            try
+            {
+                await _subscriberCts.CancelAsync().AnyContext();
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _logger.LogTrace(ex, "Subscriber CTS already disposed during cleanup");
+            }
         }
 
         if (_subscriberTask is not null)
@@ -397,7 +403,10 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
             {
                 await _subscriberTask.WaitAsync(TimeSpan.FromSeconds(5)).AnyContext();
             }
-            catch (OperationCanceledException ex) { _logger.LogTrace(ex, "Subscriber task cancelled during cleanup"); }
+            catch (OperationCanceledException ex)
+            {
+                _logger.LogTrace(ex, "Subscriber task cancelled during cleanup");
+            }
             catch (TimeoutException)
             {
                 _logger.LogWarning("Subscriber task did not complete within timeout during dispose");
