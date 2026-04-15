@@ -388,7 +388,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
         if (_subscriberCts is not null)
         {
             try { await _subscriberCts.CancelAsync().AnyContext(); }
-            catch (ObjectDisposedException) { }
+            catch (ObjectDisposedException ex) { _logger.LogTrace(ex, "Subscriber CTS already disposed during cleanup"); }
         }
 
         if (_subscriberTask is not null)
@@ -397,12 +397,12 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
             {
                 await _subscriberTask.WaitAsync(TimeSpan.FromSeconds(5)).AnyContext();
             }
-            catch (OperationCanceledException) { }
+            catch (OperationCanceledException ex) { _logger.LogTrace(ex, "Subscriber task cancelled during cleanup"); }
             catch (TimeoutException)
             {
                 _logger.LogWarning("Subscriber task did not complete within timeout during dispose");
             }
-            catch (AggregateException ex)
+            catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Error waiting for subscriber task to complete during dispose");
             }
@@ -557,7 +557,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
     private async Task<bool> ProcessMessageAsync(Amazon.SQS.Model.Message sqsMessage, CancellationToken cancellationToken)
     {
         if (_subscribers.IsEmpty)
-            return false;
+            return !cancellationToken.IsCancellationRequested;
 
         _logger.LogTrace("Processing message {MessageId}", sqsMessage.MessageId);
 
