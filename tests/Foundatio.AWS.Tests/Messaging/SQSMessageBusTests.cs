@@ -205,6 +205,12 @@ public class SQSMessageBusTests : MessageBusTestBase
     }
 
     [Fact]
+    public override Task CanHandlePoisonedMessageAsync()
+    {
+        return base.CanHandlePoisonedMessageAsync();
+    }
+
+    [Fact]
     public override Task DisposeAsync_CalledMultipleTimes_IsIdempotentAsync()
     {
         return base.DisposeAsync_CalledMultipleTimes_IsIdempotentAsync();
@@ -229,6 +235,12 @@ public class SQSMessageBusTests : MessageBusTestBase
     }
 
     [Fact]
+    public override Task PublishAsync_WithSerializationFailure_ThrowsSerializerExceptionAsync()
+    {
+        return base.PublishAsync_WithSerializationFailure_ThrowsSerializerExceptionAsync();
+    }
+
+    [Fact]
     public override Task SubscribeAsync_AfterDispose_ThrowsMessageBusExceptionAsync()
     {
         return base.SubscribeAsync_AfterDispose_ThrowsMessageBusExceptionAsync();
@@ -241,27 +253,15 @@ public class SQSMessageBusTests : MessageBusTestBase
     }
 
     [Fact]
-    public override Task CanHandlePoisonedMessageAsync()
+    public override Task SubscribeAsync_WithDeserializationFailure_SkipsMessageAsync()
     {
-        return base.CanHandlePoisonedMessageAsync();
+        return base.SubscribeAsync_WithDeserializationFailure_SkipsMessageAsync();
     }
 
     [Fact]
     public override Task SubscribeAsync_WithValidThenPoisonedMessage_DeliversOnlyValidMessageAsync()
     {
         return base.SubscribeAsync_WithValidThenPoisonedMessage_DeliversOnlyValidMessageAsync();
-    }
-
-    [Fact]
-    public override Task PublishAsync_WithSerializationFailure_ThrowsSerializerExceptionAsync()
-    {
-        return base.PublishAsync_WithSerializationFailure_ThrowsSerializerExceptionAsync();
-    }
-
-    [Fact]
-    public override Task SubscribeAsync_WithDeserializationFailure_SkipsMessageAsync()
-    {
-        return base.SubscribeAsync_WithDeserializationFailure_SkipsMessageAsync();
     }
 
     [Fact] // 2 minute timeout for durable queue test
