@@ -383,7 +383,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
         }
     }
 
-    protected override async Task CleanupAsync()
+    protected override async Task RemoveTopicSubscriptionAsync()
     {
         if (_subscriberCts is not null)
         {
@@ -416,7 +416,10 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
                 _logger.LogWarning(ex, "Error waiting for subscriber task to complete during dispose");
             }
         }
+    }
 
+    protected override async Task CleanupAsync()
+    {
         _subscriberCts?.Dispose();
 
         if (!String.IsNullOrEmpty(_subscriptionArn) && _snsClient.IsValueCreated)
