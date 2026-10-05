@@ -46,6 +46,20 @@ public static class AttributeExtensions
         return v.StringValue;
     }
 
+    /// <summary>
+    /// Gets the <c>MessageGroupId</c> system attribute of a received message, or <c>null</c> when the message has no group.
+    /// </summary>
+    public static string? MessageGroupId(this IDictionary<string, string> attributes)
+    {
+        if (attributes == null)
+            return null;
+
+        if (!attributes.TryGetValue("MessageGroupId", out string? v))
+            return null;
+
+        return v;
+    }
+
     public static string? RedrivePolicy(this IDictionary<string, string> attributes)
     {
         if (attributes == null)
