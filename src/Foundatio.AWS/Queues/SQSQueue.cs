@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -26,7 +27,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     private string? _queueUrl;
     private string? _deadUrl;
     private bool _ownsDeadLetterQueue;
-    private bool _hasNoRedrivePolicy;
 
     private long _enqueuedCount;
     private long _dequeuedCount;
@@ -44,7 +44,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             if (String.IsNullOrEmpty(options.ServiceUrl))
             {
                 var region = options.Region ?? FallbackRegionFactory.GetRegionEndpoint();
-                return new AmazonSQSClient(credentials, region);
+                return new AmazonSQSClient(credentials, new AmazonSQSConfig
+                {
+                    RegionEndpoint = region,
+                    HttpClientFactory = options.HttpClientFactory
+                });
             }
 
             return new AmazonSQSClient(
@@ -52,7 +56,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 new AmazonSQSConfig
                 {
                     RegionEndpoint = RegionEndpoint.USEast1,
-                    ServiceURL = options.ServiceUrl
+                    ServiceURL = options.ServiceUrl,
+                    HttpClientFactory = options.HttpClientFactory
                 });
         });
     }
@@ -552,12 +557,12 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     /// <summary>
     /// Resolves the dead letter queue from the source queue's redrive policy when this instance did not create the queue.
-    /// A queue without a redrive policy is remembered; SQS errors are logged and the lookup is retried on the next call.
+    /// A missing redrive policy is checked again on the next call. Lookup failures propagate so exhausted messages are retained.
     /// Only a dead letter queue that follows the <c>{name}-deadletter</c> convention is deleted by <see cref="QueueBase{T,TOptions}.DeleteQueueAsync"/>.
     /// </summary>
     private async Task EnsureDeadLetterUrlAsync(IDictionary<string, string>? queueAttributes = null)
     {
-        if (!String.IsNullOrEmpty(_deadUrl) || _hasNoRedrivePolicy)
+        if (!String.IsNullOrEmpty(_deadUrl))
             return;
 
         string? deadLetterName = null;
@@ -572,35 +577,44 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
             deadLetterName = queueAttributes.DeadLetterQueue();
             if (String.IsNullOrEmpty(deadLetterName))
-            {
-                _hasNoRedrivePolicy = true;
                 return;
-            }
 
             var deadResponse = await _client.Value.GetQueueUrlAsync(deadLetterName).AnyContext();
+            if (String.IsNullOrEmpty(deadResponse.QueueUrl))
+                throw new QueueException($"Unable to resolve dead letter queue {deadLetterName} for {_options.Name}.");
+
             _ownsDeadLetterQueue = String.Equals(deadLetterName, GetDeadLetterQueueName(), StringComparison.Ordinal);
             _deadUrl = deadResponse.QueueUrl;
         }
         catch (AmazonServiceException ex)
         {
             _logger.LogWarning(ex, "Unable to resolve dead letter queue {DeadLetterQueueName} for {QueueName}: {Message}", deadLetterName, _options.Name, ex.Message);
+            throw;
         }
     }
 
     /// <summary>
     /// Validates the options against SQS limits before <see cref="QueueBase{T,TOptions}.Enqueuing"/> handlers run,
-    /// so behaviors such as duplicate detection never observe a message that SQS would reject.
+    /// so known option violations are rejected before behaviors such as duplicate detection reserve state.
     /// </summary>
     private void ValidateEntryOptions(QueueEntryOptions options)
     {
         ValidateSqsId(options.GroupId, nameof(QueueEntryOptions.GroupId));
 
-        int attributeCount = options.Properties.Count;
-        if (!String.IsNullOrEmpty(options.CorrelationId) && !options.Properties.ContainsKey("CorrelationId"))
-            attributeCount++;
+        var attributeNames = new HashSet<string>(options.Properties.Keys, StringComparer.Ordinal);
+        string? correlationId = options.CorrelationId;
+        if (String.IsNullOrEmpty(correlationId))
+        {
+            correlationId = Activity.Current?.Id;
+            if (!String.IsNullOrEmpty(Activity.Current?.TraceStateString) && !options.Properties.ContainsKey("TraceState"))
+                attributeNames.Add("TraceState");
+        }
 
-        if (attributeCount > MaxMessageAttributes)
-            throw new QueueException(GetTooManyAttributesMessage(attributeCount));
+        if (!String.IsNullOrEmpty(correlationId))
+            attributeNames.Add("CorrelationId");
+
+        if (attributeNames.Count > MaxMessageAttributes)
+            throw new QueueException(GetTooManyAttributesMessage(attributeNames.Count));
 
         if (!IsFifo)
             return;

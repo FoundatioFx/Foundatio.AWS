@@ -10,6 +10,10 @@ public class SQSQueueOptions<T> : SharedQueueOptions<T> where T : class
     public AWSCredentials? Credentials { get; set; }
     public RegionEndpoint? Region { get; set; }
     public string? ServiceUrl { get; set; }
+    /// <summary>
+    /// Optional factory for the HTTP client used by the SQS SDK.
+    /// </summary>
+    public HttpClientFactory? HttpClientFactory { get; set; }
     public bool CanCreateQueue { get; set; } = true;
     public bool SupportDeadLetter { get; set; } = true;
     public TimeSpan ReadQueueTimeout { get; set; } = TimeSpan.FromSeconds(20);
