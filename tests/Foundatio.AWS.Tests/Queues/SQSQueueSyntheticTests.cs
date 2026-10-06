@@ -156,6 +156,29 @@ public class SQSQueueSyntheticTests
         Assert.DoesNotContain("SendMessage", transport.Operations);
     }
 
+    [Fact]
+    public async Task StartWorkingAsync_WhenDeadletterLookupFails_KeepsWorkingAndRetriesAsync()
+    {
+        // Arrange: the first dead-letter lookup for an exhausted message fails, the redelivered copy succeeds
+        using var transport = new SqsTransport
+        {
+            HasRedrivePolicy = true,
+            FailedOperation = "GetQueueAttributes",
+            FailuresRemaining = 1,
+            ExhaustedReceivesRemaining = 2
+        };
+        using var queue = CreateQueue(transport);
+        using var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        // Act
+        await queue.StartWorkingAsync((_, _) => Task.CompletedTask, cancellationToken: cancellationTokenSource.Token);
+        await transport.MessageDeleted.Task.WaitAsync(cancellationTokenSource.Token);
+
+        // Assert
+        Assert.Equal(1, transport.FailedRequests);
+        Assert.Contains("SendMessage", transport.Operations);
+    }
+
     private static SQSQueue<WorkItem> CreateQueue(SqsTransport transport) => new(new SQSQueueOptions<WorkItem>
     {
         Name = "source",
@@ -163,6 +186,7 @@ public class SQSQueueSyntheticTests
         ServiceUrl = "https://sqs.test.invalid",
         HttpClientFactory = transport,
         Retries = 0,
+        DequeueInterval = TimeSpan.FromMilliseconds(10),
         MetricsPollingEnabled = false
     });
 
@@ -184,7 +208,11 @@ public class SQSQueueSyntheticTests
         private readonly HttpClient _client;
         public bool HasRedrivePolicy { get; set; }
         public string? FailedOperation { get; set; }
+        public int FailuresRemaining { get; set; } = Int32.MaxValue;
+        public int FailedRequests { get; private set; }
+        public int ExhaustedReceivesRemaining { get; set; }
         public List<string> Operations { get; } = new();
+        public TaskCompletionSource MessageDeleted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public SqsTransport() => _client = new HttpClient(new Handler(this));
         public override HttpClient CreateHttpClient(IClientConfig clientConfig) => _client;
@@ -196,7 +224,13 @@ public class SQSQueueSyntheticTests
             {
                 string operation = request.Headers.GetValues("X-Amz-Target").Single().Split('.').Last();
                 transport.Operations.Add(operation);
-                bool failed = operation == transport.FailedOperation;
+                bool failed = operation == transport.FailedOperation && transport.FailuresRemaining > 0;
+                if (failed)
+                {
+                    transport.FailuresRemaining--;
+                    transport.FailedRequests++;
+                }
+
                 string response = failed ? "{\"__type\":\"AccessDeniedException\",\"message\":\"Synthetic lookup failure\"}" : operation switch
                 {
                     "GetQueueUrl" => "{\"QueueUrl\":\"https://sqs.test.invalid/queue\"}",
@@ -206,10 +240,15 @@ public class SQSQueueSyntheticTests
                             ? new Dictionary<string, string> { ["RedrivePolicy"] = "{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:000000000000:source-deadletter\",\"maxReceiveCount\":\"1\"}" }
                             : new Dictionary<string, string>()
                     }),
+                    "ReceiveMessage" => transport.ExhaustedReceivesRemaining-- > 0
+                        ? "{\"Messages\":[{\"MessageId\":\"message\",\"ReceiptHandle\":\"receipt\",\"Body\":\"{}\",\"MD5OfBody\":\"99914b932bd37a50b983c5e7c90ae93b\",\"Attributes\":{\"ApproximateReceiveCount\":\"5\"}}]}"
+                        : "{\"Messages\":[]}",
                     "SendMessage" => "{\"MessageId\":\"dead-message\",\"MD5OfMessageBody\":\"99914b932bd37a50b983c5e7c90ae93b\"}",
                     "DeleteMessage" => "{}",
                     _ => throw new InvalidOperationException("Unexpected synthetic SDK request: " + operation)
                 };
+                if (operation == "DeleteMessage")
+                    transport.MessageDeleted.TrySetResult();
                 return Task.FromResult(new HttpResponseMessage(failed ? HttpStatusCode.BadRequest : HttpStatusCode.OK)
                 {
                     Content = new StringContent(response, Encoding.UTF8, "application/x-amz-json-1.0")

@@ -441,6 +441,16 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                     entry = await DequeueImplAsync(linkedCancellationTokenSource.Token).AnyContext();
                 }
                 catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    Interlocked.Increment(ref _workerErrorCount);
+                    _logger.LogError(ex, "Error on Dequeue: {Message}", ex.Message);
+                    try
+                    {
+                        await _timeProvider.Delay(_options.DequeueInterval, linkedCancellationTokenSource.Token).AnyContext();
+                    }
+                    catch (OperationCanceledException) { }
+                }
 
                 if (linkedCancellationTokenSource.IsCancellationRequested || entry == null)
                     continue;
@@ -457,7 +467,16 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                     _logger.LogError(ex, "Worker error: {Message}", ex.Message);
 
                     if (!entry.IsAbandoned && !entry.IsCompleted && !linkedCancellationTokenSource.IsCancellationRequested)
-                        await entry.AbandonAsync().AnyContext();
+                    {
+                        try
+                        {
+                            await entry.AbandonAsync().AnyContext();
+                        }
+                        catch (Exception abandonEx)
+                        {
+                            _logger.LogError(abandonEx, "Worker error abandoning queue entry: {Message}", abandonEx.Message);
+                        }
+                    }
                 }
             }
 
