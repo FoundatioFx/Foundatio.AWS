@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -33,6 +32,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     private long _completedCount;
     private long _abandonedCount;
     private long _workerErrorCount;
+    private static readonly TimeSpan MinWorkerErrorDelay = TimeSpan.FromSeconds(1);
 
     public SQSQueue(SQSQueueOptions<T> options) : base(options)
     {
@@ -106,6 +106,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (!await OnEnqueuingAsync(data, options).AnyContext())
             return null;
 
+        ValidateEntryOptions(options);
+
         var message = new SendMessageRequest
         {
             QueueUrl = _queueUrl,
@@ -126,26 +128,9 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             message.DelaySeconds = Math.Max(0, Math.Min(900, delaySeconds));
         }
 
-        if (options.Properties is not null)
-        {
-            message.MessageAttributes ??= new Dictionary<string, MessageAttributeValue>();
-
-            foreach (var property in options.Properties)
-                message.MessageAttributes[property.Key] = new MessageAttributeValue
-                {
-                    DataType = "String",
-                    StringValue = property.Value // TODO: Support more than string data types
-                };
-        }
-
-        if (!String.IsNullOrEmpty(options.CorrelationId))
-        {
-            message.MessageAttributes ??= new Dictionary<string, MessageAttributeValue>();
-            message.MessageAttributes["CorrelationId"] = new MessageAttributeValue { DataType = "String", StringValue = options.CorrelationId };
-        }
-
-        if (message.MessageAttributes is { Count: > MaxMessageAttributes })
-            throw new QueueException(GetTooManyAttributesMessage(message.MessageAttributes.Count));
+        var attributes = CreateMessageAttributes(options);
+        if (attributes.Count > 0)
+            message.MessageAttributes = attributes;
 
         var response = await _client.Value.SendMessageAsync(message).AnyContext();
         if (response.HttpStatusCode != System.Net.HttpStatusCode.OK)
@@ -440,14 +425,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 {
                     entry = await DequeueImplAsync(linkedCancellationTokenSource.Token).AnyContext();
                 }
-                catch (OperationCanceledException) { }
+                catch (OperationCanceledException) when (linkedCancellationTokenSource.IsCancellationRequested) { }
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref _workerErrorCount);
                     _logger.LogError(ex, "Error on Dequeue: {Message}", ex.Message);
                     try
                     {
-                        await _timeProvider.Delay(_options.DequeueInterval, linkedCancellationTokenSource.Token).AnyContext();
+                        await _timeProvider.Delay(_options.DequeueInterval > MinWorkerErrorDelay ? _options.DequeueInterval : MinWorkerErrorDelay, linkedCancellationTokenSource.Token).AnyContext();
                     }
                     catch (OperationCanceledException) { }
                 }
@@ -613,27 +598,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     }
 
     /// <summary>
-    /// Validates the options against SQS limits before <see cref="QueueBase{T,TOptions}.Enqueuing"/> handlers run,
-    /// so known option violations are rejected before behaviors such as duplicate detection reserve state.
+    /// Validates the options against SQS limits. Runs before <see cref="QueueBase{T,TOptions}.Enqueuing"/> handlers so known
+    /// option violations are rejected before behaviors such as duplicate detection reserve state, and again after them
+    /// because handlers may change the options.
     /// </summary>
     private void ValidateEntryOptions(QueueEntryOptions options)
     {
         ValidateSqsId(options.GroupId, nameof(QueueEntryOptions.GroupId));
-
-        var attributeNames = new HashSet<string>(options.Properties.Keys, StringComparer.Ordinal);
-        string? correlationId = options.CorrelationId;
-        if (String.IsNullOrEmpty(correlationId))
-        {
-            correlationId = Activity.Current?.Id;
-            if (!String.IsNullOrEmpty(Activity.Current?.TraceStateString) && !options.Properties.ContainsKey("TraceState"))
-                attributeNames.Add("TraceState");
-        }
-
-        if (!String.IsNullOrEmpty(correlationId))
-            attributeNames.Add("CorrelationId");
-
-        if (attributeNames.Count > MaxMessageAttributes)
-            throw new QueueException(GetTooManyAttributesMessage(attributeNames.Count));
+        CreateMessageAttributes(options);
 
         if (!IsFifo)
             return;
@@ -666,9 +638,23 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         }
     }
 
-    private static string GetTooManyAttributesMessage(int count)
+    /// <summary>
+    /// Builds the SQS message attributes (custom properties plus <c>CorrelationId</c>) and enforces the SQS limit of
+    /// <see cref="MaxMessageAttributes"/> attributes per message. SQS attribute names are case-sensitive.
+    /// </summary>
+    private static Dictionary<string, MessageAttributeValue> CreateMessageAttributes(QueueEntryOptions options)
     {
-        return $"SQS allows at most {MaxMessageAttributes} message attributes per message (including CorrelationId and TraceState), but {count} were provided.";
+        var attributes = new Dictionary<string, MessageAttributeValue>(StringComparer.Ordinal);
+        foreach (var property in options.Properties)
+            attributes[property.Key] = new MessageAttributeValue { DataType = "String", StringValue = property.Value };
+
+        if (!String.IsNullOrEmpty(options.CorrelationId))
+            attributes["CorrelationId"] = new MessageAttributeValue { DataType = "String", StringValue = options.CorrelationId };
+
+        if (attributes.Count > MaxMessageAttributes)
+            throw new QueueException($"SQS allows at most {MaxMessageAttributes} message attributes per message (including CorrelationId and TraceState), but {attributes.Count} were provided.");
+
+        return attributes;
     }
 
     private async Task DeadLetterMessageAsync(SQSQueueEntry<T> entry)

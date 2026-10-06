@@ -179,6 +179,12 @@ public class SQSQueueTests : QueueTestBase
         return base.EnqueueAsync_WithSerializationError_ThrowsAndLeavesQueueEmptyAsync();
     }
 
+    [Fact]
+    public override Task EnqueueAsync_WithReusedOptions_DoesNotChangeCallerOptionsAsync()
+    {
+        return base.EnqueueAsync_WithReusedOptions_DoesNotChangeCallerOptionsAsync();
+    }
+
     [Fact(Skip = "SQS does not support custom entry IDs")]
     public override Task EnqueueAsync_WithUniqueId_UsesProvidedIdAsync()
     {
@@ -532,6 +538,12 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
+    public override Task AbandonAsync_WithGroupIdAndRetryDelay_PreservesGroupIdOnRetryAsync()
+    {
+        return base.AbandonAsync_WithGroupIdAndRetryDelay_PreservesGroupIdOnRetryAsync();
+    }
+
+    [Fact]
     public async Task DeleteQueueAsync_WithExternalDeadletterQueue_KeepsDeadletterQueueAsync()
     {
         // Arrange
@@ -643,6 +655,12 @@ public class SQSQueueTests : QueueTestBase
         {
             await CleanupQueueAsync(queue);
         }
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WhenEnqueuingHandlerClearsGroupId_EnqueuesWithoutGroupAsync()
+    {
+        return base.EnqueueAsync_WhenEnqueuingHandlerClearsGroupId_EnqueuesWithoutGroupAsync();
     }
 
     [Fact]
@@ -795,6 +813,42 @@ public class SQSQueueTests : QueueTestBase
             // Act & Assert
             await Assert.ThrowsAsync<QueueException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "test" }, options));
             Assert.Equal(0, enqueuingCount);
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WhenEnqueuingHandlerClearsGroupIdOnFifoQueue_ThrowsQueueExceptionAsync()
+    {
+        // Arrange
+        var queue = GetNamedQueue(GetFifoQueueName());
+        using var _ = queue.Enqueuing.AddSyncHandler((_, args) => args.Options.GroupId = null);
+
+        try
+        {
+            // Act & Assert
+            await Assert.ThrowsAsync<QueueException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "test" }, new QueueEntryOptions { GroupId = "tenant-1" }));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WhenEnqueuingHandlerSetsInvalidGroupId_ThrowsArgumentExceptionAsync()
+    {
+        // Arrange
+        var queue = GetNamedQueue(_queueName);
+        using var _ = queue.Enqueuing.AddSyncHandler((_, args) => args.Options.GroupId = "invalid group");
+
+        try
+        {
+            // Act & Assert
+            await Assert.ThrowsAsync<ArgumentException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "test" }));
         }
         finally
         {
