@@ -32,7 +32,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     private long _completedCount;
     private long _abandonedCount;
     private long _workerErrorCount;
-    private static readonly TimeSpan MinWorkerErrorDelay = TimeSpan.FromSeconds(1);
 
     public SQSQueue(SQSQueueOptions<T> options) : base(options)
     {
@@ -425,14 +424,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 {
                     entry = await DequeueImplAsync(linkedCancellationTokenSource.Token).AnyContext();
                 }
-                catch (OperationCanceledException) when (linkedCancellationTokenSource.IsCancellationRequested) { }
+                catch (OperationCanceledException) { }
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref _workerErrorCount);
                     _logger.LogError(ex, "Error on Dequeue: {Message}", ex.Message);
                     try
                     {
-                        await _timeProvider.Delay(_options.DequeueInterval > MinWorkerErrorDelay ? _options.DequeueInterval : MinWorkerErrorDelay, linkedCancellationTokenSource.Token).AnyContext();
+                        await _timeProvider.Delay(_options.DequeueInterval, linkedCancellationTokenSource.Token).AnyContext();
                     }
                     catch (OperationCanceledException) { }
                 }
