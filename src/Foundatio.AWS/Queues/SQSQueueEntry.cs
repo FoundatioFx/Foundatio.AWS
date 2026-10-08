@@ -17,6 +17,7 @@ public class SQSQueueEntry<T>
                 Properties.Add(property.Key, property.Value.StringValue);
         }
 
+        GroupId = message.Attributes.MessageGroupId();
         UnderlyingMessage = message;
     }
 }
