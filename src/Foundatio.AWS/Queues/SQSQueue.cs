@@ -31,7 +31,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     private long _dequeuedCount;
     private long _completedCount;
     private long _abandonedCount;
-    private long _workerErrorCount;
 
     public SQSQueue(SQSQueueOptions<T> options) : base(options)
     {
@@ -333,7 +332,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 Dequeued = _dequeuedCount,
                 Completed = _completedCount,
                 Abandoned = _abandonedCount,
-                Errors = _workerErrorCount,
+                Errors = WorkerErrorCount,
                 Timeouts = 0
             };
 
@@ -357,7 +356,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 Dequeued = _dequeuedCount,
                 Completed = _completedCount,
                 Abandoned = _abandonedCount,
-                Errors = _workerErrorCount,
+                Errors = WorkerErrorCount,
                 Timeouts = 0
             };
         }
@@ -381,7 +380,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             Dequeued = _dequeuedCount,
             Completed = _completedCount,
             Abandoned = _abandonedCount,
-            Errors = _workerErrorCount,
+            Errors = WorkerErrorCount,
             Timeouts = 0
         };
     }
@@ -401,71 +400,12 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         _dequeuedCount = 0;
         _completedCount = 0;
         _abandonedCount = 0;
-        _workerErrorCount = 0;
+        ResetWorkerErrorCount();
     }
 
     protected override void StartWorkingImpl(Func<IQueueEntry<T>, CancellationToken, Task> handler, bool autoComplete, CancellationToken cancellationToken)
     {
-        if (handler == null)
-            throw new ArgumentNullException(nameof(handler));
-
-        var linkedCancellationTokenSource = GetLinkedDisposableCancellationTokenSource(cancellationToken);
-
-        Task.Run(async () =>
-        {
-            _logger.LogTrace("WorkerLoop Start {QueueName}", _options.Name);
-
-            while (!linkedCancellationTokenSource.IsCancellationRequested)
-            {
-                _logger.LogTrace("WorkerLoop Signaled {QueueName}", _options.Name);
-
-                IQueueEntry<T>? entry = null;
-                try
-                {
-                    entry = await DequeueImplAsync(linkedCancellationTokenSource.Token).AnyContext();
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref _workerErrorCount);
-                    _logger.LogError(ex, "Error on Dequeue: {Message}", ex.Message);
-                    try
-                    {
-                        await _timeProvider.Delay(_options.DequeueInterval, linkedCancellationTokenSource.Token).AnyContext();
-                    }
-                    catch (OperationCanceledException) { }
-                }
-
-                if (linkedCancellationTokenSource.IsCancellationRequested || entry == null)
-                    continue;
-
-                try
-                {
-                    await handler(entry, linkedCancellationTokenSource.Token).AnyContext();
-                    if (autoComplete && !entry.IsAbandoned && !entry.IsCompleted && !linkedCancellationTokenSource.IsCancellationRequested)
-                        await entry.CompleteAsync().AnyContext();
-                }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref _workerErrorCount);
-                    _logger.LogError(ex, "Worker error: {Message}", ex.Message);
-
-                    if (!entry.IsAbandoned && !entry.IsCompleted && !linkedCancellationTokenSource.IsCancellationRequested)
-                    {
-                        try
-                        {
-                            await entry.AbandonAsync().AnyContext();
-                        }
-                        catch (Exception abandonEx)
-                        {
-                            _logger.LogError(abandonEx, "Worker error abandoning queue entry: {Message}", abandonEx.Message);
-                        }
-                    }
-                }
-            }
-
-            _logger.LogTrace("Worker exiting: {QueueName} IsCancellationRequested={IsCancellationRequested}", _options.Name, linkedCancellationTokenSource.IsCancellationRequested);
-        }, linkedCancellationTokenSource.Token).ContinueWith(_ => linkedCancellationTokenSource.Dispose());
+        _ = StartWorker(handler, autoComplete, cancellationToken);
     }
 
     public override void Dispose()
