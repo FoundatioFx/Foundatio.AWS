@@ -11,7 +11,7 @@ public static class AttributeExtensions
 {
     public static int ApproximateReceiveCount(this IDictionary<string, string> attributes)
     {
-        if (attributes == null)
+        if (attributes is null)
             return 0;
 
         if (!attributes.TryGetValue("ApproximateReceiveCount", out string? v))
@@ -24,7 +24,7 @@ public static class AttributeExtensions
     public static DateTime SentTimestamp(this IDictionary<string, string> attributes)
     {
         // message was sent to the queue (epoch time in milliseconds)
-        if (attributes == null)
+        if (attributes is null)
             return DateTime.MinValue;
 
         if (!attributes.TryGetValue("SentTimestamp", out string? v))
@@ -38,7 +38,7 @@ public static class AttributeExtensions
 
     public static string? CorrelationId(this IDictionary<string, MessageAttributeValue> attributes)
     {
-        if (attributes == null)
+        if (attributes is null)
             return null;
 
         if (!attributes.TryGetValue("CorrelationId", out var v))
@@ -60,7 +60,7 @@ public static class AttributeExtensions
 
     public static string? RedrivePolicy(this IDictionary<string, string> attributes)
     {
-        if (attributes == null)
+        if (attributes is null)
             return null;
 
         if (!attributes.TryGetValue("RedrivePolicy", out string? v))
@@ -71,7 +71,7 @@ public static class AttributeExtensions
 
     public static string? DeadLetterQueue(this IDictionary<string, string> attributes)
     {
-        if (attributes == null)
+        if (attributes is null)
             return null;
 
         if (!attributes.TryGetValue("RedrivePolicy", out string? v))

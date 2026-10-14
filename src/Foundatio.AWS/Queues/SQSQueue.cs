@@ -76,11 +76,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             if (String.IsNullOrEmpty(options.ServiceUrl))
             {
                 var region = options.Region ?? FallbackRegionFactory.GetRegionEndpoint();
-                return new AmazonSQSClient(credentials, new AmazonSQSConfig
-                {
-                    RegionEndpoint = region,
-                    HttpClientFactory = options.HttpClientFactory
-                });
+                return new AmazonSQSClient(credentials, region);
             }
 
             return new AmazonSQSClient(
@@ -88,8 +84,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 new AmazonSQSConfig
                 {
                     RegionEndpoint = RegionEndpoint.USEast1,
-                    ServiceURL = options.ServiceUrl,
-                    HttpClientFactory = options.HttpClientFactory
+                    ServiceURL = options.ServiceUrl
                 });
         });
     }
@@ -163,7 +158,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
 
         var response = await _client.Value.SendMessageAsync(message).AnyContext();
-        if (response.HttpStatusCode != System.Net.HttpStatusCode.OK)
+        if (response.HttpStatusCode is not System.Net.HttpStatusCode.OK)
             throw new QueueException("Failed to send SQS message.");
 
         _logger.LogTrace("Enqueued SQS message {MessageId} GroupId={GroupId}", response.MessageId, options.GroupId);
@@ -205,7 +200,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         var response = await ReceiveMessageAsync().AnyContext();
 
         // retry loop
-        while ((response?.Messages is null || response.Messages.Count == 0) && !linkedCancellationToken.IsCancellationRequested)
+        while ((response?.Messages is null || response.Messages.Count is 0) && !linkedCancellationToken.IsCancellationRequested)
         {
             if (_options.DequeueInterval > TimeSpan.Zero)
             {
@@ -222,7 +217,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             response = await ReceiveMessageAsync().AnyContext();
         }
 
-        if (response?.Messages is null || response.Messages.Count == 0)
+        if (response?.Messages is null || response.Messages.Count is 0)
         {
             _logger.LogTrace("Response null or 0 message count");
             return null;
@@ -439,7 +434,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     protected override void StartWorkingImpl(Func<IQueueEntry<T>, CancellationToken, Task> handler, bool autoComplete, CancellationToken cancellationToken)
     {
-        if (handler == null)
+        if (handler is null)
             throw new ArgumentNullException(nameof(handler));
 
         var linkedCancellationTokenSource = GetLinkedDisposableCancellationTokenSource(cancellationToken);
@@ -466,7 +461,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                     await _timeProvider.SafeDelay(errorBackoff, linkedCancellationTokenSource.Token).AnyContext();
                 }
 
-                if (linkedCancellationTokenSource.IsCancellationRequested || entry == null)
+                if (linkedCancellationTokenSource.IsCancellationRequested || entry is null)
                     continue;
 
                 try
