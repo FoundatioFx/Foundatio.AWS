@@ -404,6 +404,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         _workerErrorCount = 0;
     }
 
+    private static readonly TimeSpan MinDequeueErrorBackoff = TimeSpan.FromSeconds(1);
+
     protected override void StartWorkingImpl(Func<IQueueEntry<T>, CancellationToken, Task> handler, bool autoComplete, CancellationToken cancellationToken)
     {
         if (handler == null)
@@ -431,7 +433,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                     _logger.LogError(ex, "Error on Dequeue: {Message}", ex.Message);
                     try
                     {
-                        await _timeProvider.Delay(_options.DequeueInterval, linkedCancellationTokenSource.Token).AnyContext();
+                        var errorBackoff = _options.DequeueInterval > MinDequeueErrorBackoff ? _options.DequeueInterval : MinDequeueErrorBackoff;
+                        await _timeProvider.Delay(errorBackoff, linkedCancellationTokenSource.Token).AnyContext();
                     }
                     catch (OperationCanceledException) { }
                 }
