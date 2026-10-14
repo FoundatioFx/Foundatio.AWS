@@ -572,7 +572,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                     Interlocked.Increment(ref _workerErrorCount);
                     _logger.LogError(ex, "Error on Dequeue: {Message}", ex.Message);
                     var errorBackoff = _options.DequeueInterval > MinDequeueErrorBackoff ? _options.DequeueInterval : MinDequeueErrorBackoff;
-                    await _timeProvider.SafeDelay(errorBackoff, linkedCancellationTokenSource.Token).AnyContext();
+                    try
+                    {
+                        await _timeProvider.Delay(errorBackoff, linkedCancellationTokenSource.Token).AnyContext();
+                    }
+                    catch (OperationCanceledException) { }
                 }
 
                 if (linkedCancellationTokenSource.IsCancellationRequested || entry is null)

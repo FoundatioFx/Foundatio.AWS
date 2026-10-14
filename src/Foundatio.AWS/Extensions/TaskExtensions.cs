@@ -1,7 +1,6 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Threading;
 using System.Threading.Tasks;
 using Foundatio.AsyncEx;
 
@@ -42,17 +41,5 @@ internal static class TaskExtensions
     public static ConfiguredTaskAwaitable<TResult> AnyContext<TResult>(this AwaitableDisposable<TResult> task) where TResult : IDisposable
     {
         return task.ConfigureAwait(continueOnCapturedContext: false);
-    }
-
-    public static async Task SafeDelay(this TimeProvider timeProvider, TimeSpan delay, CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            await timeProvider.Delay(delay, cancellationToken).AnyContext();
-        }
-        catch (OperationCanceledException)
-        {
-            // Swallow the exception to allow for graceful cancellation.
-        }
     }
 }
