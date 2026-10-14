@@ -164,9 +164,62 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     private async Task RefreshContentBasedDeduplicationAsync(string queueUrl, CancellationToken cancellationToken = default)
     {
         var response = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(queueUrl, [QueueAttributeName.ContentBasedDeduplication]), cancellationToken).AnyContext();
-        _contentBasedDeduplication = response.Attributes.TryGetValue(QueueAttributeName.ContentBasedDeduplication, out string? value)
+        bool contentBasedDeduplication = response.Attributes.TryGetValue(QueueAttributeName.ContentBasedDeduplication, out string? value)
             && Boolean.TryParse(value, out bool enabled) && enabled;
+        if (contentBasedDeduplication != _contentBasedDeduplication)
+            _logger.LogDebug("Queue {QueueName} ContentBasedDeduplication is {ContentBasedDeduplication}", _options.Name, contentBasedDeduplication);
+
+        _contentBasedDeduplication = contentBasedDeduplication;
         _contentBasedDeduplicationCheckedUtc = _timeProvider.GetUtcNow();
+    }
+
+    /// <summary>
+    /// Sets the <c>MessageDeduplicationId</c> of a FIFO message: the caller's <see cref="QueueEntryOptions.UniqueId"/>, or a
+    /// generated id unless the queue derives one from the message body. SQS requires an id unless ContentBasedDeduplication is enabled.
+    /// </summary>
+    /// <returns><c>true</c> when no id was set because the queue uses content-based deduplication.</returns>
+    private async Task<bool> SetFifoDeduplicationIdAsync(SendMessageRequest message, QueueEntryOptions options)
+    {
+        if (!String.IsNullOrEmpty(options.UniqueId))
+        {
+            message.MessageDeduplicationId = options.UniqueId;
+            return false;
+        }
+
+        // The setting is only re-read periodically, so a change made with SetQueueAttributes is picked up without a call per
+        // message. A queue this instance created has not been read yet, so it is read on the first send.
+        if (_timeProvider.GetUtcNow() - _contentBasedDeduplicationCheckedUtc >= ContentBasedDeduplicationRefreshInterval)
+            await TryRefreshContentBasedDeduplicationAsync(message.QueueUrl).AnyContext();
+
+        if (_contentBasedDeduplication)
+            return true;
+
+        message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
+        return false;
+    }
+
+    /// <summary>
+    /// Re-reads the queue's ContentBasedDeduplication setting before a send. A failed read only delays the refresh, because
+    /// the cached value is still valid and a send that disagrees with the queue is recovered from (see <see cref="IsMissingDeduplicationIdError"/>).
+    /// A deleted queue is rethrown after its url is forgotten so the next call recreates it.
+    /// </summary>
+    private async Task TryRefreshContentBasedDeduplicationAsync(string queueUrl)
+    {
+        try
+        {
+            await RefreshContentBasedDeduplicationAsync(queueUrl).AnyContext();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            ForgetQueueUrl(queueUrl);
+            throw;
+        }
+        catch (AmazonSQSException ex)
+        {
+            // Retry on the next interval rather than on every send.
+            _contentBasedDeduplicationCheckedUtc = _timeProvider.GetUtcNow();
+            _logger.LogWarning(ex, "Unable to refresh ContentBasedDeduplication for queue {QueueName}; using the cached value {ContentBasedDeduplication}: {Message}", _options.Name, _contentBasedDeduplication, ex.Message);
+        }
     }
 
     /// <summary>
@@ -204,33 +257,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             MessageAttributes = CreateMessageAttributes(options)
         };
 
-        // SQS only accepts a deduplication id on FIFO queues and requires one unless ContentBasedDeduplication is enabled.
-        bool usesContentBasedDeduplication = false;
-        if (!String.IsNullOrEmpty(options.UniqueId) && _isFifo)
-        {
-            message.MessageDeduplicationId = options.UniqueId;
-        }
-        else if (_isFifo)
-        {
-            // The setting is only re-read periodically and only for implicit ids, so a change made with SetQueueAttributes
-            // is picked up without a call per message. A queue this instance created has not been read yet, so it is read first.
-            if (_timeProvider.GetUtcNow() - _contentBasedDeduplicationCheckedUtc >= ContentBasedDeduplicationRefreshInterval)
-            {
-                try
-                {
-                    await RefreshContentBasedDeduplicationAsync(message.QueueUrl!).AnyContext();
-                }
-                catch (QueueDoesNotExistException)
-                {
-                    ForgetQueueUrl(message.QueueUrl);
-                    throw;
-                }
-            }
-
-            usesContentBasedDeduplication = _contentBasedDeduplication;
-            if (!usesContentBasedDeduplication)
-                message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
-        }
+        bool usesContentBasedDeduplication = _isFifo && await SetFifoDeduplicationIdAsync(message, options).AnyContext();
 
         if (!String.IsNullOrEmpty(options.GroupId))
             message.MessageGroupId = options.GroupId;
@@ -472,9 +499,10 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (String.IsNullOrEmpty(_queueUrl))
             return CreateQueueStats(0, 0);
 
-        string? propagationFallbackUrl = GetPropagationFallbackUrl();
         var attributeNames = new List<string> { QueueAttributeName.All };
         var queueRequest = new GetQueueAttributesRequest(_queueUrl, attributeNames);
+        // Captured before the read so a read that started inside the propagation window keeps the fallback.
+        string? propagationFallbackUrl = GetPropagationFallbackUrl();
         var queueAttributes = await _client.Value.GetQueueAttributesAsync(queueRequest).AnyContext();
 
         int queueCount = queueAttributes.ApproximateNumberOfMessages;
@@ -486,7 +514,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (deadLetterUrl is null)
             return CreateQueueStats(queueCount, workingCount);
 
-        var deadAttributes = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(deadLetterUrl, attributeNames)).AnyContext();
+        var deadRequest = new GetQueueAttributesRequest(deadLetterUrl, attributeNames);
+        var deadAttributes = await _client.Value.GetQueueAttributesAsync(deadRequest).AnyContext();
         return CreateQueueStats(queueCount, workingCount, deadAttributes.ApproximateNumberOfMessages);
     }
 
@@ -508,6 +537,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     protected override async Task DeleteQueueImplAsync()
     {
+        // Serialized with EnsureQueueCreatedAsync so a concurrent create can't set the queue url (or finish a pending setup)
+        // after the queue is deleted, which would leave this instance using a deleted queue.
         using var _ = await _lock.LockAsync().AnyContext();
 
         // An instance that was never used doesn't know the queue url yet; resolve it so the source queue is deleted together
@@ -516,12 +547,18 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (queueUrl is not null)
         {
             await _client.Value.DeleteQueueAsync(queueUrl).AnyContext();
+            _logger.LogDebug("Deleted queue {QueueName}", _options.Name);
+        }
+        else
+        {
+            _logger.LogDebug("Queue {QueueName} does not exist; nothing to delete", _options.Name);
         }
 
         string? ownedDeadLetterUrl = _ownedDeadLetterUrl ?? (_options.SupportDeadLetter ? await FindQueueUrlAsync(GetDeadLetterQueueName()).AnyContext() : null);
         if (ownedDeadLetterUrl is not null)
         {
             await _client.Value.DeleteQueueAsync(ownedDeadLetterUrl).AnyContext();
+            _logger.LogDebug("Deleted dead letter queue {DeadLetterQueueName}", GetDeadLetterQueueName());
         }
 
         _queueUrl = null;
@@ -877,7 +914,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         var attributes = new Dictionary<string, MessageAttributeValue>(options.Properties.Count + 1, StringComparer.Ordinal);
         foreach (var property in options.Properties)
-            attributes[property.Key] = new MessageAttributeValue { DataType = "String", StringValue = property.Value };
+            attributes[property.Key] = new MessageAttributeValue { DataType = "String", StringValue = property.Value }; // TODO: Support more than string data types
 
         if (hasCorrelationId)
             attributes[AttributeExtensions.CorrelationIdAttributeName] = new MessageAttributeValue { DataType = "String", StringValue = options.CorrelationId };
