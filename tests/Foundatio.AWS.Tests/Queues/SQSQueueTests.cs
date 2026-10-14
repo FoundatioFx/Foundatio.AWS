@@ -1305,7 +1305,7 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
-    public async Task DeleteQueueAsync_WhenDeadletterQueueWasNotResolved_DeletesConventionalDeadletterQueueAsync()
+    public async Task DeleteQueueAsync_OnUnusedInstance_DeletesSourceAndDeadletterQueuesAsync()
     {
         // Arrange
         using (var creatingQueue = GetNamedQueue(_queueName))
@@ -1319,6 +1319,7 @@ public class SQSQueueTests : QueueTestBase
             await queue.DeleteQueueAsync();
 
             // Assert
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken));
             await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName + "-deadletter", TestCancellationToken));
         }
         finally

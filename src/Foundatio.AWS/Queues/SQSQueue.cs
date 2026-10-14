@@ -61,12 +61,20 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     /// </summary>
     private static readonly TimeSpan MinDequeueErrorBackoff = TimeSpan.FromSeconds(1);
 
+    /// <summary>
+    /// SQS attribute changes such as a new redrive policy can take up to 60 seconds to propagate.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html">SetQueueAttributes</see>.
+    /// </summary>
+    private static readonly TimeSpan QueueAttributePropagationWindow = TimeSpan.FromSeconds(60);
+
     private readonly AsyncLock _lock = new();
     private readonly Lazy<AmazonSQSClient> _client;
     private readonly bool _isFifo;
     private string? _queueUrl;
     private DeadLetterQueue? _deadLetterQueue;
     private string? _ownedDeadLetterUrl;
+    private bool _queueSetupPending;
+    private DateTimeOffset? _deadLetterCreatedUtc;
 
     private long _enqueuedCount;
     private long _dequeuedCount;
@@ -116,6 +124,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         {
             if (!String.IsNullOrEmpty(_queueUrl))
                 return;
+
+            // A previous attempt created the source queue but failed before its redrive policy was set; finish that setup
+            // instead of using the existing queue as-is.
+            if (_queueSetupPending)
+            {
+                await CreateQueueAsync().AnyContext();
+                return;
+            }
 
             try
             {
@@ -400,20 +416,27 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     protected override async Task DeleteQueueImplAsync()
     {
-        if (!String.IsNullOrEmpty(_queueUrl))
+        using var _ = await _lock.LockAsync().AnyContext();
+
+        // An instance that was never used doesn't know the queue url yet; resolve it so the source queue is deleted together
+        // with its dead letter queue rather than left with a redrive policy pointing at a deleted queue.
+        string? queueUrl = _queueUrl ?? await FindQueueUrlAsync(_options.Name).AnyContext();
+        if (queueUrl is not null)
         {
-            await _client.Value.DeleteQueueAsync(_queueUrl).AnyContext();
+            await _client.Value.DeleteQueueAsync(queueUrl).AnyContext();
         }
 
-        string? ownedDeadLetterUrl = _ownedDeadLetterUrl ?? await FindOwnedDeadLetterUrlAsync().AnyContext();
+        string? ownedDeadLetterUrl = _ownedDeadLetterUrl ?? (_options.SupportDeadLetter ? await FindQueueUrlAsync(GetDeadLetterQueueName()).AnyContext() : null);
         if (ownedDeadLetterUrl is not null)
         {
             await _client.Value.DeleteQueueAsync(ownedDeadLetterUrl).AnyContext();
         }
 
         _queueUrl = null;
+        _queueSetupPending = false;
         _deadLetterQueue = null;
         _ownedDeadLetterUrl = null;
+        _deadLetterCreatedUtc = null;
 
         _enqueuedCount = 0;
         _dequeuedCount = 0;
@@ -440,6 +463,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 IQueueEntry<T>? entry = null;
                 try
                 {
+                    // The queue url is cleared when the queue is deleted, so a running worker recreates it before receiving.
+                    await EnsureQueueCreatedAsync(linkedCancellationTokenSource.Token).AnyContext();
                     entry = await DequeueImplAsync(linkedCancellationTokenSource.Token).AnyContext();
                 }
                 catch (OperationCanceledException) { }
@@ -520,19 +545,34 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             return;
         }
 
+        _queueSetupPending = true;
+
         // step 2, create dead letter queue with the same encryption as the source queue
         var createDeadRequest = new CreateQueueRequest
         {
             QueueName = deadLetterName,
             Attributes = GetQueueTypeAttributes()
         };
-        var createDeadResponse = await _client.Value.CreateQueueAsync(createDeadRequest).AnyContext();
-        _deadLetterQueue = new DeadLetterQueue(deadLetterName, createDeadResponse.QueueUrl);
-        _ownedDeadLetterUrl = createDeadResponse.QueueUrl;
+        string deadLetterUrl;
+        try
+        {
+            var createDeadResponse = await _client.Value.CreateQueueAsync(createDeadRequest).AnyContext();
+            deadLetterUrl = createDeadResponse.QueueUrl;
+        }
+        catch (QueueNameExistsException ex)
+        {
+            // A dead letter queue left by an earlier version can have different attributes (for example no encryption);
+            // keep using it rather than failing queue creation.
+            _logger.LogWarning(ex, "Dead letter queue {DeadLetterQueueName} already exists with different attributes; using it as-is", deadLetterName);
+            deadLetterUrl = (await _client.Value.GetQueueUrlAsync(deadLetterName).AnyContext()).QueueUrl;
+        }
+
+        _deadLetterQueue = new DeadLetterQueue(deadLetterName, deadLetterUrl);
+        _ownedDeadLetterUrl = deadLetterUrl;
 
         // step 3, get dead letter attributes
         var attributeNames = new List<string> { QueueAttributeName.QueueArn };
-        var deadAttributeRequest = new GetQueueAttributesRequest(createDeadResponse.QueueUrl, attributeNames);
+        var deadAttributeRequest = new GetQueueAttributesRequest(deadLetterUrl, attributeNames);
         var deadAttributeResponse = await _client.Value.GetQueueAttributesAsync(deadAttributeRequest).AnyContext();
 
         int maxReceiveCount = Math.Max(_options.Retries + 1, 1);
@@ -550,20 +590,16 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         var setAttributeRequest = new SetQueueAttributesRequest(queueUrl, attributes);
         await _client.Value.SetQueueAttributesAsync(setAttributeRequest).AnyContext();
+        _deadLetterCreatedUtc = _timeProvider.GetUtcNow();
+        _queueSetupPending = false;
         _queueUrl = queueUrl;
     }
 
-    /// <summary>
-    /// Finds the conventionally named dead letter queue when this instance never created or resolved it.
-    /// </summary>
-    private async Task<string?> FindOwnedDeadLetterUrlAsync()
+    private async Task<string?> FindQueueUrlAsync(string queueName)
     {
-        if (!_options.SupportDeadLetter)
-            return null;
-
         try
         {
-            var response = await _client.Value.GetQueueUrlAsync(GetDeadLetterQueueName()).AnyContext();
+            var response = await _client.Value.GetQueueUrlAsync(queueName).AnyContext();
             return response.QueueUrl;
         }
         catch (QueueDoesNotExistException)
@@ -622,9 +658,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             deadLetterName = queueAttributes.DeadLetterQueue();
             if (String.IsNullOrEmpty(deadLetterName))
             {
-                // Attribute changes can take up to 60 seconds to propagate, so a queue this instance just created may not
-                // report its redrive policy yet; keep using the dead letter queue it created instead of deleting messages.
-                return _ownedDeadLetterUrl;
+                // A queue this instance just created may not report its redrive policy yet; keep using the dead letter
+                // queue it created during that window instead of deleting messages. Afterwards a removed policy is honored.
+                return _deadLetterCreatedUtc is { } createdUtc && _timeProvider.GetUtcNow() - createdUtc < QueueAttributePropagationWindow
+                    ? _ownedDeadLetterUrl
+                    : null;
             }
 
             var cached = _deadLetterQueue;
