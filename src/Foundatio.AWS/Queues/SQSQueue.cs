@@ -350,18 +350,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     protected override async Task<QueueStats> GetQueueStatsImplAsync()
     {
         if (String.IsNullOrEmpty(_queueUrl))
-            return new QueueStats
-            {
-                Queued = 0,
-                Working = 0,
-                Deadletter = 0,
-                Enqueued = _enqueuedCount,
-                Dequeued = _dequeuedCount,
-                Completed = _completedCount,
-                Abandoned = _abandonedCount,
-                Errors = _workerErrorCount,
-                Timeouts = 0
-            };
+            return CreateQueueStats(0, 0);
 
         var attributeNames = new List<string> { QueueAttributeName.All };
         var queueRequest = new GetQueueAttributesRequest(_queueUrl, attributeNames);
@@ -369,39 +358,24 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         int queueCount = queueAttributes.ApproximateNumberOfMessages;
         int workingCount = queueAttributes.ApproximateNumberOfMessagesNotVisible;
-        int deadCount = 0;
-
-        // dead letter supported
         if (!_options.SupportDeadLetter)
-        {
-            return new QueueStats
-            {
-                Queued = queueCount,
-                Working = workingCount,
-                Deadletter = deadCount,
-                Enqueued = _enqueuedCount,
-                Dequeued = _dequeuedCount,
-                Completed = _completedCount,
-                Abandoned = _abandonedCount,
-                Errors = _workerErrorCount,
-                Timeouts = 0
-            };
-        }
+            return CreateQueueStats(queueCount, workingCount);
 
-        // get attributes from dead letter
         string? deadLetterUrl = await ResolveDeadLetterUrlAsync(queueAttributes.Attributes).AnyContext();
-        if (deadLetterUrl is not null)
-        {
-            var deadRequest = new GetQueueAttributesRequest(deadLetterUrl, attributeNames);
-            var deadAttributes = await _client.Value.GetQueueAttributesAsync(deadRequest).AnyContext();
-            deadCount = deadAttributes.ApproximateNumberOfMessages;
-        }
+        if (deadLetterUrl is null)
+            return CreateQueueStats(queueCount, workingCount);
 
+        var deadAttributes = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(deadLetterUrl, attributeNames)).AnyContext();
+        return CreateQueueStats(queueCount, workingCount, deadAttributes.ApproximateNumberOfMessages);
+    }
+
+    private QueueStats CreateQueueStats(long queued, long working, long deadletter = 0)
+    {
         return new QueueStats
         {
-            Queued = queueCount,
-            Working = workingCount,
-            Deadletter = deadCount,
+            Queued = queued,
+            Working = working,
+            Deadletter = deadletter,
             Enqueued = _enqueuedCount,
             Dequeued = _dequeuedCount,
             Completed = _completedCount,
@@ -724,11 +698,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     {
         _logger.LogInformation("Exceeded retry limit ({Attempts}/{Retries}), moving message {QueueEntryId} to dead letter", entry.Attempts, _options.Retries, entry.Id);
 
+        var message = entry.UnderlyingMessage;
         string? deadLetterUrl = _options.SupportDeadLetter ? await ResolveDeadLetterUrlAsync().AnyContext() : null;
         if (deadLetterUrl is not null)
         {
-            var message = entry.UnderlyingMessage;
-            var deadMessage = new SendMessageRequest
+            await _client.Value.SendMessageAsync(new SendMessageRequest
             {
                 QueueUrl = deadLetterUrl,
                 MessageBody = message.Body,
@@ -736,13 +710,12 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 MessageAttributes = message.MessageAttributes is { Count: > 0 } ? message.MessageAttributes : null,
                 MessageGroupId = message.Attributes.MessageGroupId(),
                 MessageDeduplicationId = _isFifo ? message.MessageId : null
-            };
-
-            await _client.Value.SendMessageAsync(deadMessage).AnyContext();
+            }).AnyContext();
         }
 
-        await _client.Value.DeleteMessageAsync(_queueUrl, entry.UnderlyingMessage.ReceiptHandle).AnyContext();
+        await _client.Value.DeleteMessageAsync(_queueUrl, message.ReceiptHandle).AnyContext();
     }
+
 
     private sealed record DeadLetterQueue(string Name, string Url);
 
