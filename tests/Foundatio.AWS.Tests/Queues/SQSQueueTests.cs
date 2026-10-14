@@ -1067,6 +1067,7 @@ public class SQSQueueTests : QueueTestBase
         {
             if (deadLetterUrl is not null)
                 await queue.Client.DeleteQueueAsync(deadLetterUrl, TestCancellationToken);
+
             await CleanupQueueAsync(queue);
         }
     }
@@ -1152,6 +1153,7 @@ public class SQSQueueTests : QueueTestBase
             await workerCancellation.CancelAsync();
             if (deadLetterUrl is not null)
                 await queue.Client.DeleteQueueAsync(deadLetterUrl, TestCancellationToken);
+
             await CleanupQueueAsync(queue);
         }
     }
