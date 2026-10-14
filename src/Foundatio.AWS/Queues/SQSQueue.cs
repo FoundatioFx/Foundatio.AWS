@@ -461,7 +461,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         string? queueUrl = _queueUrl ?? await FindQueueUrlAsync(_options.Name).AnyContext();
         string? ownedDeadLetterUrl = _createdDeadLetterUrl;
         if (ownedDeadLetterUrl is null && queueUrl is not null && _options.SupportDeadLetter)
+        {
+            // Kept so a retry after a failed dead letter delete still deletes it once the source and its policy are gone.
             ownedDeadLetterUrl = await FindPolicyDeadLetterUrlAsync(queueUrl).AnyContext();
+            _createdDeadLetterUrl = ownedDeadLetterUrl;
+        }
 
         if (queueUrl is not null)
             await DeleteQueueIfExistsAsync(queueUrl, _options.Name).AnyContext();
