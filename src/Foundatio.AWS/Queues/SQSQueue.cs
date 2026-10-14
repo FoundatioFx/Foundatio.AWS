@@ -67,6 +67,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     /// </summary>
     private static readonly TimeSpan QueueAttributePropagationWindow = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// How long the FIFO queue's <c>ContentBasedDeduplication</c> setting is cached; it can be changed with SetQueueAttributes.
+    /// </summary>
+    private static readonly TimeSpan ContentBasedDeduplicationRefreshInterval = TimeSpan.FromMinutes(5);
+
     private readonly AsyncLock _lock = new();
     private readonly Lazy<AmazonSQSClient> _client;
     private readonly bool _isFifo;
@@ -75,6 +80,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     private string? _ownedDeadLetterUrl;
     private bool _queueSetupPending;
     private bool _contentBasedDeduplication;
+    private DateTimeOffset _contentBasedDeduplicationCheckedUtc;
     private DateTimeOffset? _deadLetterCreatedUtc;
 
     private long _enqueuedCount;
@@ -137,7 +143,9 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             try
             {
                 var urlResponse = await _client.Value.GetQueueUrlAsync(_options.Name, cancellationToken).AnyContext();
-                _contentBasedDeduplication = _isFifo && await IsContentBasedDeduplicationEnabledAsync(urlResponse.QueueUrl, cancellationToken).AnyContext();
+                if (_isFifo)
+                    await RefreshContentBasedDeduplicationAsync(urlResponse.QueueUrl, cancellationToken).AnyContext();
+
                 _queueUrl = urlResponse.QueueUrl;
             }
             catch (QueueDoesNotExistException)
@@ -158,11 +166,20 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     /// existing FIFO queue doesn't derive one from the message body.
     /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html">SendMessage</see>.
     /// </summary>
-    private async Task<bool> IsContentBasedDeduplicationEnabledAsync(string queueUrl, CancellationToken cancellationToken)
+    private async Task RefreshContentBasedDeduplicationAsync(string queueUrl, CancellationToken cancellationToken = default)
     {
         var response = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(queueUrl, [QueueAttributeName.ContentBasedDeduplication]), cancellationToken).AnyContext();
-        return response.Attributes.TryGetValue(QueueAttributeName.ContentBasedDeduplication, out string? value)
+        _contentBasedDeduplication = response.Attributes.TryGetValue(QueueAttributeName.ContentBasedDeduplication, out string? value)
             && Boolean.TryParse(value, out bool enabled) && enabled;
+        _contentBasedDeduplicationCheckedUtc = _timeProvider.GetUtcNow();
+    }
+
+    /// <summary>
+    /// SQS rejects a FIFO message without a deduplication id once content-based deduplication has been turned off.
+    /// </summary>
+    private static bool IsMissingDeduplicationIdError(AmazonSQSException ex)
+    {
+        return ex.ErrorCode is "InvalidParameterValue" && ex.Message.Contains("ContentBasedDeduplication", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -193,10 +210,22 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         };
 
         // SQS only accepts a deduplication id on FIFO queues and requires one unless ContentBasedDeduplication is enabled.
+        bool usesContentBasedDeduplication = false;
         if (!String.IsNullOrEmpty(options.UniqueId) && _isFifo)
+        {
             message.MessageDeduplicationId = options.UniqueId;
-        else if (_isFifo && !_contentBasedDeduplication)
-            message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
+        }
+        else if (_isFifo)
+        {
+            // The setting is only re-read periodically and only for implicit ids, so a change made with SetQueueAttributes
+            // is picked up without a call per message.
+            if (_contentBasedDeduplicationCheckedUtc != default && _timeProvider.GetUtcNow() - _contentBasedDeduplicationCheckedUtc >= ContentBasedDeduplicationRefreshInterval)
+                await RefreshContentBasedDeduplicationAsync(_queueUrl!).AnyContext();
+
+            usesContentBasedDeduplication = _contentBasedDeduplication;
+            if (!usesContentBasedDeduplication)
+                message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
+        }
 
         if (!String.IsNullOrEmpty(options.GroupId))
             message.MessageGroupId = options.GroupId;
@@ -218,6 +247,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         {
             ForgetQueueUrl(message.QueueUrl);
             throw;
+        }
+        catch (AmazonSQSException ex) when (usesContentBasedDeduplication && IsMissingDeduplicationIdError(ex))
+        {
+            // Content-based deduplication was turned off since it was last read; send once more with a generated id.
+            _contentBasedDeduplication = false;
+            _contentBasedDeduplicationCheckedUtc = _timeProvider.GetUtcNow();
+            message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
+            response = await _client.Value.SendMessageAsync(message).AnyContext();
         }
 
         if (response.HttpStatusCode is not System.Net.HttpStatusCode.OK)
@@ -485,6 +522,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         _queueUrl = null;
         _queueSetupPending = false;
         _contentBasedDeduplication = false;
+        _contentBasedDeduplicationCheckedUtc = default;
         _deadLetterQueue = null;
         _ownedDeadLetterUrl = null;
         _deadLetterCreatedUtc = null;

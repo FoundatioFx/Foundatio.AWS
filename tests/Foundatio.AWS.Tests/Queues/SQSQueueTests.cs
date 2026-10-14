@@ -1365,6 +1365,48 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
+    public async Task EnqueueAsync_WhenContentBasedDeduplicationIsTurnedOff_SendsGeneratedDeduplicationIdAsync()
+    {
+        // Arrange
+        string fifoName = GetFifoQueueName();
+        using (var creatingQueue = GetNamedQueue(fifoName, supportDeadLetter: false))
+            await creatingQueue.Client.CreateQueueAsync(new CreateQueueRequest
+            {
+                QueueName = fifoName,
+                Attributes = new Dictionary<string, string>
+                {
+                    [QueueAttributeName.FifoQueue] = "true",
+                    [QueueAttributeName.ContentBasedDeduplication] = "true"
+                }
+            }, TestCancellationToken);
+
+        var queue = GetNamedQueue(fifoName, supportDeadLetter: false);
+
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "first" }, new QueueEntryOptions { GroupId = "group" });
+            var queueUrl = await queue.Client.GetQueueUrlAsync(fifoName, TestCancellationToken);
+            await queue.Client.SetQueueAttributesAsync(queueUrl.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.ContentBasedDeduplication] = "false" }, TestCancellationToken);
+
+            // Act
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "second" }, new QueueEntryOptions { GroupId = "group" });
+
+            // Assert
+            var first = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(first);
+            await first.CompleteAsync();
+            var second = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(second);
+            Assert.Equal("second", second.Value.Data);
+            await second.CompleteAsync();
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
     public async Task EnqueueAsync_AfterQueueDeletedExternally_RecreatesQueueOnNextCallAsync()
     {
         // Arrange
