@@ -117,7 +117,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     protected override bool SupportsGroupId => true;
 
-
     protected override async Task EnsureQueueCreatedAsync(CancellationToken cancellationToken = default)
     {
         if (!String.IsNullOrEmpty(_queueUrl))
