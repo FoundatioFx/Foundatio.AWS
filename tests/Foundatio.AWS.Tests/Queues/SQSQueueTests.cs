@@ -1434,6 +1434,63 @@ public class SQSQueueTests : QueueTestBase
         }
     }
 
+    [Fact]
+    public async Task EnqueueAsync_WhenContentBasedDeduplicationIsTurnedOnAfterQueueCreated_DeduplicatesIdenticalBodiesAsync()
+    {
+        // Arrange
+        string fifoName = GetFifoQueueName();
+        var queue = GetNamedQueue(fifoName, supportDeadLetter: false);
+
+        try
+        {
+            Assert.Null(await queue.DequeueAsync(TimeSpan.Zero));
+            var queueUrl = await queue.Client.GetQueueUrlAsync(fifoName, TestCancellationToken);
+            await queue.Client.SetQueueAttributesAsync(queueUrl.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.ContentBasedDeduplication] = "true" }, TestCancellationToken);
+
+            // Act
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "same" }, new QueueEntryOptions { GroupId = "group" });
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "same" }, new QueueEntryOptions { GroupId = "group" });
+
+            // Assert
+            var first = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(first);
+            await first.CompleteAsync();
+            Assert.Null(await queue.DequeueAsync(TimeSpan.FromSeconds(2)));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WhenFifoQueueDeletedExternallyBeforeDeduplicationRefresh_RecreatesQueueOnNextCallAsync()
+    {
+        // Arrange
+        string fifoName = GetFifoQueueName();
+        var queue = GetNamedQueue(fifoName, supportDeadLetter: false);
+
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "before" }, new QueueEntryOptions { GroupId = "group", UniqueId = "before" });
+            var queueUrl = await queue.Client.GetQueueUrlAsync(fifoName, TestCancellationToken);
+            await queue.Client.DeleteQueueAsync(queueUrl.QueueUrl, TestCancellationToken);
+
+            // Act
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "stale" }, new QueueEntryOptions { GroupId = "group" }));
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "after" }, new QueueEntryOptions { GroupId = "group" });
+
+            // Assert
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+            Assert.Equal("after", entry.Value.Data);
+            await entry.CompleteAsync();
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
     private static async Task SetRedrivePolicyAsync(SQSQueue<SimpleWorkItem> queue, string queueName, string deadLetterName)
     {
         var queueUrl = await queue.Client.GetQueueUrlAsync(queueName);

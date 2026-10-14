@@ -218,9 +218,19 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         else if (_isFifo)
         {
             // The setting is only re-read periodically and only for implicit ids, so a change made with SetQueueAttributes
-            // is picked up without a call per message.
-            if (_contentBasedDeduplicationCheckedUtc != default && _timeProvider.GetUtcNow() - _contentBasedDeduplicationCheckedUtc >= ContentBasedDeduplicationRefreshInterval)
-                await RefreshContentBasedDeduplicationAsync(_queueUrl!).AnyContext();
+            // is picked up without a call per message. A queue this instance created has not been read yet, so it is read first.
+            if (_timeProvider.GetUtcNow() - _contentBasedDeduplicationCheckedUtc >= ContentBasedDeduplicationRefreshInterval)
+            {
+                try
+                {
+                    await RefreshContentBasedDeduplicationAsync(message.QueueUrl!).AnyContext();
+                }
+                catch (QueueDoesNotExistException)
+                {
+                    ForgetQueueUrl(message.QueueUrl);
+                    throw;
+                }
+            }
 
             usesContentBasedDeduplication = _contentBasedDeduplication;
             if (!usesContentBasedDeduplication)
