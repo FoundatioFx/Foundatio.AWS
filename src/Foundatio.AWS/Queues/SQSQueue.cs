@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -41,6 +42,15 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     /// </summary>
     private const string FifoQueueSuffix = ".fifo";
 
+    /// <summary>
+    /// Maximum visibility timeout, which bounds the retry delay of an abandoned message.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibility.html">ChangeMessageVisibility</see>.
+    /// </summary>
+    private const int MaxVisibilityTimeoutSeconds = 43200;
+
+    /// <summary>
+    /// Application attribute that carries <see cref="QueueEntryOptions.CorrelationId"/>.
+    /// </summary>
     private const string CorrelationIdAttributeName = "CorrelationId";
 
     /// <summary>
@@ -322,7 +332,10 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         }
         else
         {
-            int visibilityTimeout = (int)Math.Round(_options.RetryDelay(sqsQueueEntry.Attempts).TotalSeconds, MidpointRounding.AwayFromZero);
+            // On FIFO queues the abandoned message keeps its group blocked until it becomes visible again, so the
+            // retry delay also delays every later message in the same group.
+            double retryDelaySeconds = Math.Round(_options.RetryDelay(sqsQueueEntry.Attempts).TotalSeconds, MidpointRounding.AwayFromZero);
+            int visibilityTimeout = (int)Math.Clamp(retryDelaySeconds, 0, MaxVisibilityTimeoutSeconds);
 
             var request = new ChangeMessageVisibilityRequest
             {
@@ -391,11 +404,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         {
             await _client.Value.DeleteQueueAsync(_queueUrl).AnyContext();
         }
-        if (_ownedDeadLetterUrl is not null)
+
+        string? ownedDeadLetterUrl = _ownedDeadLetterUrl ?? await FindOwnedDeadLetterUrlAsync().AnyContext();
+        if (ownedDeadLetterUrl is not null)
         {
-            await _client.Value.DeleteQueueAsync(_ownedDeadLetterUrl).AnyContext();
+            await _client.Value.DeleteQueueAsync(ownedDeadLetterUrl).AnyContext();
         }
 
+        _queueUrl = null;
         _deadLetterQueue = null;
         _ownedDeadLetterUrl = null;
 
@@ -487,30 +503,24 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (_options.SupportDeadLetter && deadLetterName.Length > MaxQueueNameLength)
             throw new QueueException($"The dead letter queue name {deadLetterName} exceeds the SQS limit of {MaxQueueNameLength} characters; use a queue name of at most {MaxQueueNameLength - (deadLetterName.Length - _options.Name.Length)} characters.");
 
-        // step 1, create queue
+        // step 1, create queue. _queueUrl is only set once the whole setup succeeds, so a partially created queue is
+        // never used without its redrive policy (exhausted messages would otherwise be deleted instead of dead lettered).
         var createQueueRequest = new CreateQueueRequest
         {
             QueueName = _options.Name,
             Attributes = GetQueueTypeAttributes()
         };
 
-        if (_options.SqsManagedSseEnabled)
-        {
-            createQueueRequest.Attributes[QueueAttributeName.SqsManagedSseEnabled] = "true";
-        }
-        else if (!String.IsNullOrEmpty(_options.KmsMasterKeyId))
-        {
-            createQueueRequest.Attributes[QueueAttributeName.KmsMasterKeyId] = _options.KmsMasterKeyId;
-            createQueueRequest.Attributes[QueueAttributeName.KmsDataKeyReusePeriodSeconds] = _options.KmsDataKeyReusePeriodSeconds.ToString();
-        }
-
         var createQueueResponse = await _client.Value.CreateQueueAsync(createQueueRequest).AnyContext();
-        _queueUrl = createQueueResponse.QueueUrl;
+        string queueUrl = createQueueResponse.QueueUrl;
 
         if (!_options.SupportDeadLetter)
+        {
+            _queueUrl = queueUrl;
             return;
+        }
 
-        // step 2, create dead letter queue
+        // step 2, create dead letter queue with the same encryption as the source queue
         var createDeadRequest = new CreateQueueRequest
         {
             QueueName = deadLetterName,
@@ -538,8 +548,28 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             [QueueAttributeName.RedrivePolicy] = redrivePolicy.ToJsonString()
         };
 
-        var setAttributeRequest = new SetQueueAttributesRequest(_queueUrl, attributes);
+        var setAttributeRequest = new SetQueueAttributesRequest(queueUrl, attributes);
         await _client.Value.SetQueueAttributesAsync(setAttributeRequest).AnyContext();
+        _queueUrl = queueUrl;
+    }
+
+    /// <summary>
+    /// Finds the conventionally named dead letter queue when this instance never created or resolved it.
+    /// </summary>
+    private async Task<string?> FindOwnedDeadLetterUrlAsync()
+    {
+        if (!_options.SupportDeadLetter)
+            return null;
+
+        try
+        {
+            var response = await _client.Value.GetQueueUrlAsync(GetDeadLetterQueueName()).AnyContext();
+            return response.QueueUrl;
+        }
+        catch (QueueDoesNotExistException)
+        {
+            return null;
+        }
     }
 
     private Dictionary<string, string> GetQueueTypeAttributes()
@@ -547,6 +577,16 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         var attributes = new Dictionary<string, string>();
         if (_isFifo)
             attributes[QueueAttributeName.FifoQueue] = "true";
+
+        if (_options.SqsManagedSseEnabled)
+        {
+            attributes[QueueAttributeName.SqsManagedSseEnabled] = "true";
+        }
+        else if (!String.IsNullOrEmpty(_options.KmsMasterKeyId))
+        {
+            attributes[QueueAttributeName.KmsMasterKeyId] = _options.KmsMasterKeyId;
+            attributes[QueueAttributeName.KmsDataKeyReusePeriodSeconds] = _options.KmsDataKeyReusePeriodSeconds.ToString();
+        }
 
         return attributes;
     }
@@ -581,7 +621,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
             deadLetterName = queueAttributes.DeadLetterQueue();
             if (String.IsNullOrEmpty(deadLetterName))
-                return null;
+            {
+                // Attribute changes can take up to 60 seconds to propagate, so a queue this instance just created may not
+                // report its redrive policy yet; keep using the dead letter queue it created instead of deleting messages.
+                return _ownedDeadLetterUrl;
+            }
 
             var cached = _deadLetterQueue;
             if (cached is not null && String.Equals(cached.Name, deadLetterName, StringComparison.Ordinal))
@@ -597,7 +641,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
             return deadResponse.QueueUrl;
         }
-        catch (AmazonServiceException ex)
+        catch (Exception ex) when (ex is AmazonServiceException or JsonException)
         {
             _logger.LogWarning(ex, "Unable to resolve dead letter queue {DeadLetterQueueName} for {QueueName}: {Message}", deadLetterName, _options.Name, ex.Message);
             throw;

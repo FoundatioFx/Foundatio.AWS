@@ -1277,6 +1277,56 @@ public class SQSQueueTests : QueueTestBase
         }
     }
 
+    [Fact]
+    public async Task AbandonAsync_WhenCreatedRedrivePolicyIsNotVisibleYet_UsesCreatedDeadletterQueueAsync()
+    {
+        // Arrange
+        var queue = GetNamedQueue(_queueName, retries: 0);
+
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "propagating" });
+            var queueUrl = await queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken);
+            await queue.Client.SetQueueAttributesAsync(queueUrl.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.RedrivePolicy] = "" }, TestCancellationToken);
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+
+            // Act
+            await entry.AbandonAsync();
+
+            // Assert
+            var deadLetterUrl = await queue.Client.GetQueueUrlAsync(_queueName + "-deadletter", TestCancellationToken);
+            Assert.Equal("propagating", Deserialize(await ReceiveBodyAsync(queue, deadLetterUrl.QueueUrl)));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteQueueAsync_WhenDeadletterQueueWasNotResolved_DeletesConventionalDeadletterQueueAsync()
+    {
+        // Arrange
+        using (var creatingQueue = GetNamedQueue(_queueName))
+            await creatingQueue.EnqueueAsync(new SimpleWorkItem { Data = "delete" });
+
+        var queue = GetNamedQueue(_queueName);
+
+        try
+        {
+            // Act
+            await queue.DeleteQueueAsync();
+
+            // Assert
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName + "-deadletter", TestCancellationToken));
+        }
+        finally
+        {
+            queue.Dispose();
+        }
+    }
+
     private static async Task SetRedrivePolicyAsync(SQSQueue<SimpleWorkItem> queue, string queueName, string deadLetterName)
     {
         var queueUrl = await queue.Client.GetQueueUrlAsync(queueName);
