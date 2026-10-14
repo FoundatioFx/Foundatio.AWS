@@ -1334,6 +1334,34 @@ public class SQSQueueTests : QueueTestBase
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeleteQueueAsync_OnUnusedInstanceWithUnrelatedConventionalDeadletterQueue_KeepsItAsync(bool sourceExists)
+    {
+        // Arrange
+        var queue = GetNamedQueue(_queueName);
+        var unrelated = await queue.Client.CreateQueueAsync(_queueName + "-deadletter", TestCancellationToken);
+        if (sourceExists)
+            await queue.Client.CreateQueueAsync(_queueName, TestCancellationToken);
+
+        try
+        {
+            // Act
+            await queue.DeleteQueueAsync();
+
+            // Assert
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken));
+            var unrelatedUrl = await queue.Client.GetQueueUrlAsync(_queueName + "-deadletter", TestCancellationToken);
+            Assert.Equal(unrelated.QueueUrl, unrelatedUrl.QueueUrl);
+        }
+        finally
+        {
+            await queue.Client.DeleteQueueAsync(unrelated.QueueUrl, TestCancellationToken);
+            queue.Dispose();
+        }
+    }
+
     [Fact]
     public async Task EnqueueAsync_OnFifoQueueWithContentBasedDeduplication_DeduplicatesIdenticalBodiesAsync()
     {

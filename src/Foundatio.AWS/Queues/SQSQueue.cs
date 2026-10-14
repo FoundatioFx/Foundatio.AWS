@@ -209,7 +209,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (response.HttpStatusCode is not System.Net.HttpStatusCode.OK)
             throw new QueueException("Failed to send SQS message.");
 
-        _logger.LogTrace("Enqueued SQS message {MessageId} GroupId={GroupId}", response.MessageId, options.GroupId);
+        _logger.LogTrace("Enqueued SQS message {MessageId} HasGroupId={HasGroupId}", response.MessageId, !String.IsNullOrEmpty(options.GroupId));
 
         Interlocked.Increment(ref _enqueuedCount);
         var entry = new QueueEntry<T>(response.MessageId, options.CorrelationId, data, this, _timeProvider.GetUtcNow().UtcDateTime, 0) { GroupId = options.GroupId };
@@ -452,24 +452,20 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         using var _ = await _lock.LockAsync().AnyContext();
 
         // An instance that was never used doesn't know the queue url yet; resolve it so the source queue is deleted together
-        // with its dead letter queue rather than left with a redrive policy pointing at a deleted queue.
+        // with its dead letter queue rather than left with a redrive policy pointing at a deleted queue. The dead letter queue
+        // is resolved before the source is deleted, because its ownership is confirmed from the source's redrive policy.
         string? queueUrl = _queueUrl ?? await FindQueueUrlAsync(_options.Name).AnyContext();
-        if (queueUrl is not null)
-        {
-            await _client.Value.DeleteQueueAsync(queueUrl).AnyContext();
-            _logger.LogDebug("Deleted queue {QueueName}", _options.Name);
-        }
-        else
-        {
-            _logger.LogDebug("Queue {QueueName} does not exist; nothing to delete", _options.Name);
-        }
+        string? ownedDeadLetterUrl = _ownedDeadLetterUrl;
+        if (ownedDeadLetterUrl is null && queueUrl is not null && _options.SupportDeadLetter)
+            ownedDeadLetterUrl = await FindPolicyDeadLetterUrlAsync(queueUrl).AnyContext();
 
-        string? ownedDeadLetterUrl = _ownedDeadLetterUrl ?? (_options.SupportDeadLetter ? await FindQueueUrlAsync(GetDeadLetterQueueName()).AnyContext() : null);
+        if (queueUrl is not null)
+            await DeleteQueueIfExistsAsync(queueUrl, _options.Name).AnyContext();
+        else
+            _logger.LogDebug("Queue {QueueName} does not exist; nothing to delete", _options.Name);
+
         if (ownedDeadLetterUrl is not null)
-        {
-            await _client.Value.DeleteQueueAsync(ownedDeadLetterUrl).AnyContext();
-            _logger.LogDebug("Deleted dead letter queue {DeadLetterQueueName}", GetDeadLetterQueueName());
-        }
+            await DeleteQueueIfExistsAsync(ownedDeadLetterUrl, GetDeadLetterQueueName()).AnyContext();
 
         _queueUrl = null;
         _queueSetupPending = false;
@@ -575,22 +571,34 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         // step 1, create queue. _queueUrl is only set once the whole setup succeeds, so a partially created queue is
         // never used without its redrive policy (exhausted messages would otherwise be deleted instead of dead lettered).
+        // Setup is marked pending before the call, because SQS can create the queue even when the response is lost; the
+        // retry then calls CreateQueue again, which returns the existing queue when its attributes match.
         var createQueueRequest = new CreateQueueRequest
         {
             QueueName = _options.Name,
             Attributes = GetQueueTypeAttributes()
         };
 
-        var createQueueResponse = await _client.Value.CreateQueueAsync(createQueueRequest).AnyContext();
-        string queueUrl = createQueueResponse.QueueUrl;
+        _queueSetupPending = _options.SupportDeadLetter;
+        string queueUrl;
+        try
+        {
+            var createQueueResponse = await _client.Value.CreateQueueAsync(createQueueRequest).AnyContext();
+            queueUrl = createQueueResponse.QueueUrl;
+        }
+        catch (QueueNameExistsException)
+        {
+            // Another party created the queue with different attributes; the next call uses it as an existing queue
+            // instead of retrying a CreateQueue that can't succeed.
+            _queueSetupPending = false;
+            throw;
+        }
 
         if (!_options.SupportDeadLetter)
         {
             _queueUrl = queueUrl;
             return;
         }
-
-        _queueSetupPending = true;
 
         // step 2, create dead letter queue with the same encryption as the source queue
         var createDeadRequest = new CreateQueueRequest
@@ -710,6 +718,11 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         try
         {
             response = await _client.Value.GetQueueAttributesAsync(request).AnyContext();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            ForgetQueueUrl(request.QueueUrl);
+            throw;
         }
         catch (AmazonServiceException ex)
         {
@@ -951,6 +964,52 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     {
         if (queueUrl is not null && Interlocked.CompareExchange(ref _queueUrl, null, queueUrl) == queueUrl)
             _contentBasedDeduplicationResolved = false;
+    }
+
+    /// <summary>
+    /// Returns the dead letter queue an existing source queue's redrive policy targets, but only when it follows the
+    /// <c>{name}-deadletter</c> convention, so a shared or externally managed queue is never treated as owned. A queue
+    /// that merely has the conventional name isn't enough: the source must point at it.
+    /// </summary>
+    private async Task<string?> FindPolicyDeadLetterUrlAsync(string queueUrl)
+    {
+        string? deadLetterName;
+        try
+        {
+            var response = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(queueUrl, [QueueAttributeName.RedrivePolicy])).AnyContext();
+            deadLetterName = response.Attributes.DeadLetterQueue();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            return null;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Unable to parse the redrive policy for {QueueName}; its dead letter queue is not deleted: {Message}", _options.Name, ex.Message);
+            return null;
+        }
+
+        string ownedName = GetDeadLetterQueueName();
+        if (!String.Equals(deadLetterName, ownedName, StringComparison.Ordinal))
+        {
+            _logger.LogDebug("Dead letter queue {DeadLetterQueueName} of {QueueName} is not owned by this queue; it is not deleted", deadLetterName, _options.Name);
+            return null;
+        }
+
+        return await FindQueueUrlAsync(ownedName).AnyContext();
+    }
+
+    private async Task DeleteQueueIfExistsAsync(string queueUrl, string queueName)
+    {
+        try
+        {
+            await _client.Value.DeleteQueueAsync(queueUrl).AnyContext();
+            _logger.LogDebug("Deleted queue {QueueName}", queueName);
+        }
+        catch (QueueDoesNotExistException)
+        {
+            _logger.LogDebug("Queue {QueueName} was already deleted", queueName);
+        }
     }
 
     private QueueStats CreateQueueStats(long queued, long working, long deadletter = 0)
