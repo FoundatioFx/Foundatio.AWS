@@ -1410,8 +1410,10 @@ public class SQSQueueTests : QueueTestBase
         }
     }
 
-    [Fact]
-    public async Task EnqueueAsync_AfterQueueDeletedExternally_RecreatesQueueOnNextCallAsync()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EnqueueAsync_AfterQueueDeletedExternally_RecreatesQueueOnNextCallAsync(bool detectedByStats)
     {
         // Arrange
         var queue = GetNamedQueue(_queueName, supportDeadLetter: false);
@@ -1423,7 +1425,11 @@ public class SQSQueueTests : QueueTestBase
             await queue.Client.DeleteQueueAsync(queueUrl.QueueUrl, TestCancellationToken);
 
             // Act
-            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "stale" }));
+            if (detectedByStats)
+                await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.GetQueueStatsAsync());
+            else
+                await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "stale" }));
+
             await queue.EnqueueAsync(new SimpleWorkItem { Data = "after" });
 
             // Assert
@@ -1468,7 +1474,7 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
-    public async Task EnqueueAsync_WhenFifoQueueDeletedExternallyBeforeDeduplicationRefresh_RecreatesQueueOnNextCallAsync()
+    public async Task EnqueueAsync_WhenFifoQueueDeletedExternallyBeforeDeduplicationIsRead_RecreatesQueueOnNextCallAsync()
     {
         // Arrange
         string fifoName = GetFifoQueueName();

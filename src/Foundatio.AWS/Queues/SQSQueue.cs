@@ -195,7 +195,15 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             _logger.LogDebug("Queue {QueueName} ContentBasedDeduplication was turned off; resending with a generated deduplication id", _options.Name);
             _contentBasedDeduplication = false;
             message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
-            response = await _client.Value.SendMessageAsync(message).AnyContext();
+            try
+            {
+                response = await _client.Value.SendMessageAsync(message).AnyContext();
+            }
+            catch (QueueDoesNotExistException)
+            {
+                ForgetQueueUrl(message.QueueUrl);
+                throw;
+            }
         }
 
         if (response.HttpStatusCode is not System.Net.HttpStatusCode.OK)
@@ -412,7 +420,16 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         var queueRequest = new GetQueueAttributesRequest(_queueUrl, attributeNames);
         // Captured before the read so a read that started inside the propagation window keeps the fallback.
         string? propagationFallbackUrl = GetPropagationFallbackUrl();
-        var queueAttributes = await _client.Value.GetQueueAttributesAsync(queueRequest).AnyContext();
+        GetQueueAttributesResponse queueAttributes;
+        try
+        {
+            queueAttributes = await _client.Value.GetQueueAttributesAsync(queueRequest).AnyContext();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            ForgetQueueUrl(queueRequest.QueueUrl);
+            throw;
+        }
 
         int queueCount = queueAttributes.ApproximateNumberOfMessages;
         int workingCount = queueAttributes.ApproximateNumberOfMessagesNotVisible;
@@ -889,8 +906,10 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     /// <remarks>
     /// The setting isn't polled. If it is turned off later, SQS rejects the send and it is retried with a generated id
     /// (see <see cref="IsMissingDeduplicationIdError"/>). If it is turned on later, generated ids keep being sent, which is
-    /// valid but bypasses content-based deduplication until the queue is reopened. A failed read is treated the same way so
-    /// a missing <c>sqs:GetQueueAttributes</c> permission costs one warning, not a call per send.
+    /// valid but bypasses content-based deduplication until the queue is reopened. If the read fails (for example a missing
+    /// <c>sqs:GetQueueAttributes</c> permission), the next send omits the id and the outcome settles the setting: it succeeds
+    /// when content-based deduplication is enabled, and otherwise is rejected and retried with a generated id. A failed read
+    /// therefore costs one warning, not a call per send, and doesn't disable content-based deduplication.
     /// </remarks>
     private async Task ResolveContentBasedDeduplicationAsync(string queueUrl)
     {
@@ -908,8 +927,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         }
         catch (AmazonSQSException ex)
         {
-            _contentBasedDeduplication = false;
-            _logger.LogWarning(ex, "Unable to read ContentBasedDeduplication for queue {QueueName}; sending generated deduplication ids: {Message}", _options.Name, ex.Message);
+            _contentBasedDeduplication = true;
+            _logger.LogWarning(ex, "Unable to read ContentBasedDeduplication for queue {QueueName}; the next send determines it: {Message}", _options.Name, ex.Message);
         }
 
         _contentBasedDeduplicationResolved = true;
