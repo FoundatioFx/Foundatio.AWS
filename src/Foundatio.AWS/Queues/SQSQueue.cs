@@ -813,11 +813,12 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         return count;
     }
 
+    /// <summary>
+    /// Compares keys ordinally rather than with <see cref="IDictionary{TKey,TValue}.ContainsKey"/>, because the caller's
+    /// dictionary may be case-insensitive while SQS attribute names are not.
+    /// </summary>
     private static bool HasCorrelationIdProperty(IDictionary<string, string> properties)
     {
-        if (!properties.ContainsKey(AttributeExtensions.CorrelationIdAttributeName))
-            return false;
-
         foreach (string key in properties.Keys)
         {
             if (String.Equals(key, AttributeExtensions.CorrelationIdAttributeName, StringComparison.Ordinal))

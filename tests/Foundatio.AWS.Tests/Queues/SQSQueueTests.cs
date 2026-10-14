@@ -412,7 +412,9 @@ public class SQSQueueTests : QueueTestBase
     [Fact]
     public async Task CanGetQueueItemWithDeliveryDelayAndEnsureMessageNotMarkedWorkingWhileWaiting()
     {
-        var queue = GetQueue(dequeueInterval: TimeSpan.Zero, readQueueTimeout: TimeSpan.FromSeconds(2));
+        // The SDK can't abort a long poll, so a dequeue can run one poll past its timeout. A poll shorter than half the
+        // delivery delay keeps the first dequeue from receiving the delayed message.
+        var queue = GetQueue(dequeueInterval: TimeSpan.Zero, readQueueTimeout: TimeSpan.FromSeconds(1));
         if (queue == null)
             return;
 
