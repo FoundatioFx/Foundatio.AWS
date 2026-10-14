@@ -688,6 +688,31 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
+    public async Task EnqueueAsync_WithZeroDeliveryDelayOnFifoQueue_EnqueuesAsync()
+    {
+        // Arrange
+        var queue = GetNamedQueue(GetFifoQueueName());
+        var options = new QueueEntryOptions { GroupId = "tenant-1", DeliveryDelay = TimeSpan.Zero };
+
+        try
+        {
+            // Act
+            string? id = await queue.EnqueueAsync(new SimpleWorkItem { Data = "test" }, options);
+
+            // Assert
+            Assert.NotNull(id);
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+            Assert.Equal("test", entry.Value.Data);
+            await entry.CompleteAsync();
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
     public async Task EnqueueAsync_WithDuplicateUniqueIdOnFifoQueue_DeliversOnceAsync()
     {
         // Arrange

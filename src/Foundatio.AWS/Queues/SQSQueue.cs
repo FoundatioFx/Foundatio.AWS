@@ -121,7 +121,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             message.MessageGroupId = options.GroupId;
 
         // NOTE: Any delay defined here will override any delay configured in the SQS.
-        if (options.DeliveryDelay.HasValue)
+        if (options.DeliveryDelay.HasValue && !IsFifo)
         {
             int delaySeconds = (int)options.DeliveryDelay.Value.TotalSeconds;
             message.DelaySeconds = Math.Max(0, Math.Min(900, delaySeconds));
@@ -612,7 +612,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (String.IsNullOrEmpty(options.GroupId))
             throw new QueueException($"A GroupId is required when enqueuing to the FIFO queue {_options.Name}.");
 
-        if (options.DeliveryDelay.HasValue)
+        if (options.DeliveryDelay > TimeSpan.Zero)
             throw new QueueException($"FIFO queue {_options.Name} does not support per-message delivery delays; configure DelaySeconds on the queue instead.");
 
         if (!String.IsNullOrEmpty(options.UniqueId))
