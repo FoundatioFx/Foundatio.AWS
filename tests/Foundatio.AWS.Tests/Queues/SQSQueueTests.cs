@@ -1155,6 +1155,7 @@ public class SQSQueueTests : QueueTestBase
             await CleanupQueueAsync(queue);
         }
     }
+
     [Theory]
     [InlineData(10, false)]
     [InlineData(9, true)]
@@ -1491,6 +1492,7 @@ public class SQSQueueTests : QueueTestBase
             await CleanupQueueAsync(queue);
         }
     }
+
     private static async Task SetRedrivePolicyAsync(SQSQueue<SimpleWorkItem> queue, string queueName, string deadLetterName)
     {
         var queueUrl = await queue.Client.GetQueueUrlAsync(queueName);

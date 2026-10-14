@@ -885,6 +885,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
         return attributes;
     }
+
     private async Task DeadLetterMessageAsync(SQSQueueEntry<T> entry)
     {
         _logger.LogInformation("Exceeded retry limit ({Attempts}/{Retries}), moving message {QueueEntryId} to dead letter", entry.Attempts, _options.Retries, entry.Id);
