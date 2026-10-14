@@ -9,6 +9,11 @@ namespace Foundatio.Queues;
 
 public static class AttributeExtensions
 {
+    /// <summary>
+    /// Application attribute that carries <see cref="QueueEntryOptions.CorrelationId"/>; it is not exposed in <see cref="IQueueEntry.Properties"/>.
+    /// </summary>
+    internal const string CorrelationIdAttributeName = "CorrelationId";
+
     public static int ApproximateReceiveCount(this IDictionary<string, string> attributes)
     {
         if (attributes is null)
@@ -41,7 +46,7 @@ public static class AttributeExtensions
         if (attributes is null)
             return null;
 
-        if (!attributes.TryGetValue("CorrelationId", out var v))
+        if (!attributes.TryGetValue(CorrelationIdAttributeName, out var v))
             return null;
 
         return v.StringValue;

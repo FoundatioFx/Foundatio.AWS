@@ -48,10 +48,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     /// </summary>
     private const int MaxVisibilityTimeoutSeconds = 43200;
 
-    /// <summary>
-    /// Application attribute that carries <see cref="QueueEntryOptions.CorrelationId"/>.
-    /// </summary>
-    private const string CorrelationIdAttributeName = "CorrelationId";
 
     /// <summary>
     /// Minimum wait after a failed receive in the worker loop. The SDK already retries transient errors with backoff
@@ -858,12 +854,12 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     private static bool HasCorrelationIdProperty(IDictionary<string, string> properties)
     {
-        if (!properties.ContainsKey(CorrelationIdAttributeName))
+        if (!properties.ContainsKey(AttributeExtensions.CorrelationIdAttributeName))
             return false;
 
         foreach (string key in properties.Keys)
         {
-            if (String.Equals(key, CorrelationIdAttributeName, StringComparison.Ordinal))
+            if (String.Equals(key, AttributeExtensions.CorrelationIdAttributeName, StringComparison.Ordinal))
                 return true;
         }
 
@@ -885,7 +881,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             attributes[property.Key] = new MessageAttributeValue { DataType = "String", StringValue = property.Value };
 
         if (hasCorrelationId)
-            attributes[CorrelationIdAttributeName] = new MessageAttributeValue { DataType = "String", StringValue = options.CorrelationId };
+            attributes[AttributeExtensions.CorrelationIdAttributeName] = new MessageAttributeValue { DataType = "String", StringValue = options.CorrelationId };
 
         return attributes;
     }

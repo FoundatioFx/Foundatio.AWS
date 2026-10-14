@@ -831,6 +831,7 @@ public class SQSQueueTests : QueueTestBase
             var sqsEntry = Assert.IsType<SQSQueueEntry<SimpleWorkItem>>(entry);
             Assert.Equal("tenant-123", sqsEntry.UnderlyingMessage.Attributes["MessageGroupId"]);
             Assert.Equal("tenant-123", sqsEntry.GroupId);
+            Assert.Empty(sqsEntry.Properties);
             await sqsEntry.CompleteAsync();
         }
         finally
