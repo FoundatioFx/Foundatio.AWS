@@ -1334,6 +1334,39 @@ public class SQSQueueTests : QueueTestBase
         }
     }
 
+    [Fact]
+    public async Task DeleteQueueAsync_AfterRedrivePolicyRemoved_KeepsResolvedDeadletterQueueAsync()
+    {
+        // Arrange
+        string deadLetterName = _queueName + "-deadletter";
+        var queue = GetNamedQueue(_queueName);
+        var deadLetter = await queue.Client.CreateQueueAsync(deadLetterName, TestCancellationToken);
+        var source = await queue.Client.CreateQueueAsync(_queueName, TestCancellationToken);
+
+        try
+        {
+            // The instance opens the existing queue and resolves the conventional dead letter queue from its policy.
+            await SetRedrivePolicyAsync(queue, _queueName, deadLetterName);
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "test" });
+            var stats = await queue.GetQueueStatsAsync();
+            Assert.Equal(0, stats.Deadletter);
+            await queue.Client.SetQueueAttributesAsync(source.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.RedrivePolicy] = "" }, TestCancellationToken);
+
+            // Act
+            await queue.DeleteQueueAsync();
+
+            // Assert
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken));
+            var deadLetterUrl = await queue.Client.GetQueueUrlAsync(deadLetterName, TestCancellationToken);
+            Assert.Equal(deadLetter.QueueUrl, deadLetterUrl.QueueUrl);
+        }
+        finally
+        {
+            await queue.Client.DeleteQueueAsync(deadLetter.QueueUrl, TestCancellationToken);
+            queue.Dispose();
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
