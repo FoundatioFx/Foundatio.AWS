@@ -498,7 +498,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
                     {
                         try
                         {
-                            await _timeProvider.Delay(_options.DequeueInterval, cancellationToken).AnyContext();
+                            await Task.Delay(_options.DequeueInterval, _timeProvider, cancellationToken).AnyContext();
                         }
                         catch (OperationCanceledException)
                         {
@@ -554,7 +554,7 @@ public class SQSMessageBus : MessageBusBase<SQSMessageBusOptions>
 
                 try
                 {
-                    await _timeProvider.Delay(TimeSpan.FromSeconds(1), cancellationToken).AnyContext();
+                    await Task.Delay(TimeSpan.FromSeconds(1), _timeProvider, cancellationToken).AnyContext();
                 }
                 catch (OperationCanceledException)
                 {

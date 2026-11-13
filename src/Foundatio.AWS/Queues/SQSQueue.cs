@@ -271,7 +271,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             {
                 try
                 {
-                    await _timeProvider.Delay(_options.DequeueInterval, linkedCancellationToken).AnyContext();
+                    await Task.Delay(_options.DequeueInterval, _timeProvider, linkedCancellationToken).AnyContext();
                 }
                 catch (OperationCanceledException)
                 {
@@ -520,7 +520,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                     var errorBackoff = _options.DequeueInterval > MinDequeueErrorBackoff ? _options.DequeueInterval : MinDequeueErrorBackoff;
                     try
                     {
-                        await _timeProvider.Delay(errorBackoff, linkedCancellationTokenSource.Token).AnyContext();
+                        await Task.Delay(errorBackoff, _timeProvider, linkedCancellationTokenSource.Token).AnyContext();
                     }
                     catch (OperationCanceledException) { }
                 }
