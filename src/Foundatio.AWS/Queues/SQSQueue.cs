@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,15 +18,58 @@ namespace Foundatio.Queues;
 
 public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 {
+    /// <summary>
+    /// SQS allows at most 10 message attributes per message.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-message-metadata.html">SQS message metadata</see>.
+    /// </summary>
     private const int MaxMessageAttributes = 10;
+
+    /// <summary>
+    /// Maximum length of <c>MessageGroupId</c> and <c>MessageDeduplicationId</c>.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html">SendMessage</see>.
+    /// </summary>
     private const int MaxSqsIdLength = 128;
+
+    /// <summary>
+    /// Maximum length of a queue name, including the <c>.fifo</c> suffix.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_CreateQueue.html">CreateQueue</see>.
+    /// </summary>
+    private const int MaxQueueNameLength = 80;
+
+    /// <summary>
+    /// Required suffix of FIFO queue names.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-fifo-queues.html">FIFO queues</see>.
+    /// </summary>
     private const string FifoQueueSuffix = ".fifo";
+
+    /// <summary>
+    /// Maximum visibility timeout, which bounds the retry delay of an abandoned message.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibility.html">ChangeMessageVisibility</see>.
+    /// </summary>
+    private const int MaxVisibilityTimeoutSeconds = 43200;
+
+
+    /// <summary>
+    /// SQS attribute changes such as a new redrive policy can take up to 60 seconds to propagate.
+    /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html">SetQueueAttributes</see>.
+    /// </summary>
+    private static readonly TimeSpan QueueAttributePropagationWindow = TimeSpan.FromSeconds(60);
+
 
     private readonly AsyncLock _lock = new();
     private readonly Lazy<AmazonSQSClient> _client;
+    private readonly bool _isFifo;
     private string? _queueUrl;
-    private string? _deadUrl;
-    private bool _ownsDeadLetterQueue;
+    private DeadLetterQueue? _deadLetterQueue;
+    /// <summary>
+    /// The dead letter queue this instance created (or adopted while creating the source queue). Only this one is deleted
+    /// without checking the source's current redrive policy; a queue merely resolved from the policy is revalidated on delete.
+    /// </summary>
+    private string? _createdDeadLetterUrl;
+    private bool _queueSetupPending;
+    private bool _contentBasedDeduplication;
+    private bool _contentBasedDeduplicationResolved;
+    private DateTimeOffset? _deadLetterCreatedUtc;
 
     private long _enqueuedCount;
     private long _dequeuedCount;
@@ -34,6 +78,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     public SQSQueue(SQSQueueOptions<T> options) : base(options)
     {
+        _isFifo = _options.Name.EndsWith(FifoQueueSuffix, StringComparison.Ordinal);
+
         // TODO: Flow through the options like retries and the like.
         _client = new Lazy<AmazonSQSClient>(() =>
         {
@@ -42,11 +88,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             if (String.IsNullOrEmpty(options.ServiceUrl))
             {
                 var region = options.Region ?? FallbackRegionFactory.GetRegionEndpoint();
-                return new AmazonSQSClient(credentials, new AmazonSQSConfig
-                {
-                    RegionEndpoint = region,
-                    HttpClientFactory = options.HttpClientFactory
-                });
+                return new AmazonSQSClient(credentials, region);
             }
 
             return new AmazonSQSClient(
@@ -54,8 +96,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
                 new AmazonSQSConfig
                 {
                     RegionEndpoint = RegionEndpoint.USEast1,
-                    ServiceURL = options.ServiceUrl,
-                    HttpClientFactory = options.HttpClientFactory
+                    ServiceURL = options.ServiceUrl
                 });
         });
     }
@@ -67,8 +108,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     protected override bool SupportsGroupId => true;
 
-    private bool IsFifo => _options.Name.EndsWith(FifoQueueSuffix, StringComparison.Ordinal);
-
     protected override async Task EnsureQueueCreatedAsync(CancellationToken cancellationToken = default)
     {
         if (!String.IsNullOrEmpty(_queueUrl))
@@ -78,6 +117,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         {
             if (!String.IsNullOrEmpty(_queueUrl))
                 return;
+
+            // A previous attempt created the source queue but failed before its redrive policy was set; finish that setup
+            // instead of using the existing queue as-is.
+            if (_queueSetupPending)
+            {
+                await CreateQueueAsync().AnyContext();
+                return;
+            }
 
             try
             {
@@ -104,37 +151,60 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         if (!await OnEnqueuingAsync(data, options).AnyContext())
             return null;
 
+        // Enqueuing handlers may change the options, so the options that are actually sent are validated again.
         ValidateEntryOptions(options);
 
         var message = new SendMessageRequest
         {
             QueueUrl = _queueUrl,
-            MessageBody = _serializer.SerializeToString(data)
+            MessageBody = _serializer.SerializeToString(data),
+            MessageAttributes = CreateMessageAttributes(options)
         };
 
-        // SQS only accepts a deduplication id on FIFO queues and requires one unless ContentBasedDeduplication is enabled.
-        if (IsFifo)
-            message.MessageDeduplicationId = !String.IsNullOrEmpty(options.UniqueId) ? options.UniqueId : Guid.NewGuid().ToString("N");
+        bool usesContentBasedDeduplication = _isFifo && await SetFifoDeduplicationIdAsync(message, options).AnyContext();
 
         if (!String.IsNullOrEmpty(options.GroupId))
             message.MessageGroupId = options.GroupId;
 
         // NOTE: Any delay defined here will override any delay configured in the SQS.
-        if (options.DeliveryDelay.HasValue)
+        if (options.DeliveryDelay.HasValue && !_isFifo)
         {
             int delaySeconds = (int)options.DeliveryDelay.Value.TotalSeconds;
             message.DelaySeconds = Math.Max(0, Math.Min(900, delaySeconds));
         }
 
-        var attributes = CreateMessageAttributes(options);
-        if (attributes.Count > 0)
-            message.MessageAttributes = attributes;
 
-        var response = await _client.Value.SendMessageAsync(message).AnyContext();
-        if (response.HttpStatusCode != System.Net.HttpStatusCode.OK)
+        SendMessageResponse response;
+        try
+        {
+            response = await _client.Value.SendMessageAsync(message).AnyContext();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            ForgetQueueUrl(message.QueueUrl);
+            throw;
+        }
+        catch (AmazonSQSException ex) when (usesContentBasedDeduplication && IsMissingDeduplicationIdError(ex))
+        {
+            // Content-based deduplication was turned off since it was read; send once more with a generated id.
+            _logger.LogDebug("Queue {QueueName} ContentBasedDeduplication was turned off; resending with a generated deduplication id", _options.Name);
+            _contentBasedDeduplication = false;
+            message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
+            try
+            {
+                response = await _client.Value.SendMessageAsync(message).AnyContext();
+            }
+            catch (QueueDoesNotExistException)
+            {
+                ForgetQueueUrl(message.QueueUrl);
+                throw;
+            }
+        }
+
+        if (response.HttpStatusCode is not System.Net.HttpStatusCode.OK)
             throw new QueueException("Failed to send SQS message.");
 
-        _logger.LogTrace("Enqueued SQS message {MessageId} GroupId={GroupId}", response.MessageId, options.GroupId);
+        _logger.LogTrace("Enqueued SQS message {MessageId} HasGroupId={HasGroupId}", response.MessageId, !String.IsNullOrEmpty(options.GroupId));
 
         Interlocked.Increment(ref _enqueuedCount);
         var entry = new QueueEntry<T>(response.MessageId, options.CorrelationId, data, this, _timeProvider.GetUtcNow().UtcDateTime, 0) { GroupId = options.GroupId };
@@ -167,19 +237,32 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             // The aws sdk will not abort a http long pull operation when the cancellation token is cancelled.
             // The aws sdk will throw the OperationCanceledException after the long poll http call is returned and
             // the message will be marked as in-flight but not returned from this call: https://github.com/aws/aws-sdk-net/issues/1680
-            return _client.Value.ReceiveMessageAsync(request, CancellationToken.None);
+            return ReceiveAsync();
+        }
+
+        async Task<ReceiveMessageResponse> ReceiveAsync()
+        {
+            try
+            {
+                return await _client.Value.ReceiveMessageAsync(request, CancellationToken.None).AnyContext();
+            }
+            catch (QueueDoesNotExistException)
+            {
+                ForgetQueueUrl(request.QueueUrl);
+                throw;
+            }
         }
 
         var response = await ReceiveMessageAsync().AnyContext();
 
         // retry loop
-        while ((response?.Messages is null || response.Messages.Count == 0) && !linkedCancellationToken.IsCancellationRequested)
+        while ((response?.Messages is null || response.Messages.Count is 0) && !linkedCancellationToken.IsCancellationRequested)
         {
             if (_options.DequeueInterval > TimeSpan.Zero)
             {
                 try
                 {
-                    await _timeProvider.Delay(_options.DequeueInterval, linkedCancellationToken).AnyContext();
+                    await Task.Delay(_options.DequeueInterval, _timeProvider, linkedCancellationToken).AnyContext();
                 }
                 catch (OperationCanceledException)
                 {
@@ -190,7 +273,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             response = await ReceiveMessageAsync().AnyContext();
         }
 
-        if (response?.Messages is null || response.Messages.Count == 0)
+        if (response?.Messages is null || response.Messages.Count is 0)
         {
             _logger.LogTrace("Response null or 0 message count");
             return null;
@@ -295,7 +378,10 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         }
         else
         {
-            int visibilityTimeout = (int)Math.Round(_options.RetryDelay(sqsQueueEntry.Attempts).TotalSeconds, MidpointRounding.AwayFromZero);
+            // On FIFO queues the abandoned message keeps its group blocked until it becomes visible again, so the
+            // retry delay also delays every later message in the same group.
+            double retryDelaySeconds = Math.Round(_options.RetryDelay(sqsQueueEntry.Attempts).TotalSeconds, MidpointRounding.AwayFromZero);
+            int visibilityTimeout = (int)Math.Clamp(retryDelaySeconds, 0, MaxVisibilityTimeoutSeconds);
 
             var request = new ChangeMessageVisibilityRequest
             {
@@ -323,78 +409,70 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     protected override async Task<QueueStats> GetQueueStatsImplAsync()
     {
         if (String.IsNullOrEmpty(_queueUrl))
-            return new QueueStats
-            {
-                Queued = 0,
-                Working = 0,
-                Deadletter = 0,
-                Enqueued = _enqueuedCount,
-                Dequeued = _dequeuedCount,
-                Completed = _completedCount,
-                Abandoned = _abandonedCount,
-                Errors = WorkerErrorCount,
-                Timeouts = 0
-            };
+            return CreateQueueStats(0, 0);
 
         var attributeNames = new List<string> { QueueAttributeName.All };
         var queueRequest = new GetQueueAttributesRequest(_queueUrl, attributeNames);
-        var queueAttributes = await _client.Value.GetQueueAttributesAsync(queueRequest).AnyContext();
+        // Captured before the read so a read that started inside the propagation window keeps the fallback.
+        string? propagationFallbackUrl = GetPropagationFallbackUrl();
+        GetQueueAttributesResponse queueAttributes;
+        try
+        {
+            queueAttributes = await _client.Value.GetQueueAttributesAsync(queueRequest).AnyContext();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            ForgetQueueUrl(queueRequest.QueueUrl);
+            throw;
+        }
 
         int queueCount = queueAttributes.ApproximateNumberOfMessages;
         int workingCount = queueAttributes.ApproximateNumberOfMessagesNotVisible;
-        int deadCount = 0;
-
-        // dead letter supported
         if (!_options.SupportDeadLetter)
-        {
-            return new QueueStats
-            {
-                Queued = queueCount,
-                Working = workingCount,
-                Deadletter = deadCount,
-                Enqueued = _enqueuedCount,
-                Dequeued = _dequeuedCount,
-                Completed = _completedCount,
-                Abandoned = _abandonedCount,
-                Errors = WorkerErrorCount,
-                Timeouts = 0
-            };
-        }
+            return CreateQueueStats(queueCount, workingCount);
 
-        await EnsureDeadLetterUrlAsync(queueAttributes.Attributes).AnyContext();
+        string? deadLetterUrl = await ResolveDeadLetterUrlAsync(queueAttributes.Attributes, propagationFallbackUrl).AnyContext();
+        if (deadLetterUrl is null)
+            return CreateQueueStats(queueCount, workingCount);
 
-        // get attributes from dead letter
-        if (!String.IsNullOrEmpty(_deadUrl))
-        {
-            var deadRequest = new GetQueueAttributesRequest(_deadUrl, attributeNames);
-            var deadAttributes = await _client.Value.GetQueueAttributesAsync(deadRequest).AnyContext();
-            deadCount = deadAttributes.ApproximateNumberOfMessages;
-        }
-
-        return new QueueStats
-        {
-            Queued = queueCount,
-            Working = workingCount,
-            Deadletter = deadCount,
-            Enqueued = _enqueuedCount,
-            Dequeued = _dequeuedCount,
-            Completed = _completedCount,
-            Abandoned = _abandonedCount,
-            Errors = WorkerErrorCount,
-            Timeouts = 0
-        };
+        var deadRequest = new GetQueueAttributesRequest(deadLetterUrl, attributeNames);
+        var deadAttributes = await _client.Value.GetQueueAttributesAsync(deadRequest).AnyContext();
+        return CreateQueueStats(queueCount, workingCount, deadAttributes.ApproximateNumberOfMessages);
     }
 
     protected override async Task DeleteQueueImplAsync()
     {
-        if (!String.IsNullOrEmpty(_queueUrl))
+        // Serialized with EnsureQueueCreatedAsync so a concurrent create can't set the queue url (or finish a pending setup)
+        // after the queue is deleted, which would leave this instance using a deleted queue.
+        using var _ = await _lock.LockAsync().AnyContext();
+
+        // An instance that was never used doesn't know the queue url yet; resolve it so the source queue is deleted together
+        // with its dead letter queue rather than left with a redrive policy pointing at a deleted queue. The dead letter queue
+        // is resolved before the source is deleted, because its ownership is confirmed from the source's redrive policy.
+        string? queueUrl = _queueUrl ?? await FindQueueUrlAsync(_options.Name).AnyContext();
+        string? ownedDeadLetterUrl = _createdDeadLetterUrl;
+        if (ownedDeadLetterUrl is null && queueUrl is not null && _options.SupportDeadLetter)
         {
-            await _client.Value.DeleteQueueAsync(_queueUrl).AnyContext();
+            // Kept so a retry after a failed dead letter delete still deletes it once the source and its policy are gone.
+            ownedDeadLetterUrl = await FindPolicyDeadLetterUrlAsync(queueUrl).AnyContext();
+            _createdDeadLetterUrl = ownedDeadLetterUrl;
         }
-        if (!String.IsNullOrEmpty(_deadUrl) && _ownsDeadLetterQueue)
-        {
-            await _client.Value.DeleteQueueAsync(_deadUrl).AnyContext();
-        }
+
+        if (queueUrl is not null)
+            await DeleteQueueIfExistsAsync(queueUrl, _options.Name).AnyContext();
+        else
+            _logger.LogDebug("Queue {QueueName} does not exist; nothing to delete", _options.Name);
+
+        if (ownedDeadLetterUrl is not null)
+            await DeleteQueueIfExistsAsync(ownedDeadLetterUrl, GetDeadLetterQueueName()).AnyContext();
+
+        _queueUrl = null;
+        _queueSetupPending = false;
+        _contentBasedDeduplication = false;
+        _contentBasedDeduplicationResolved = false;
+        _deadLetterQueue = null;
+        _createdDeadLetterUrl = null;
+        _deadLetterCreatedUtc = null;
 
         _enqueuedCount = 0;
         _dequeuedCount = 0;
@@ -424,42 +502,67 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     protected virtual async Task CreateQueueAsync()
     {
-        // step 1, create queue
+        string deadLetterName = GetDeadLetterQueueName();
+        if (_options.SupportDeadLetter && deadLetterName.Length > MaxQueueNameLength)
+            throw new QueueException($"The dead letter queue name {deadLetterName} exceeds the SQS limit of {MaxQueueNameLength} characters; use a queue name of at most {MaxQueueNameLength - (deadLetterName.Length - _options.Name.Length)} characters.");
+
+        // step 1, create queue. _queueUrl is only set once the whole setup succeeds, so a partially created queue is
+        // never used without its redrive policy (exhausted messages would otherwise be deleted instead of dead lettered).
+        // Setup is marked pending before the call, because SQS can create the queue even when the response is lost; the
+        // retry then calls CreateQueue again, which returns the existing queue when its attributes match.
         var createQueueRequest = new CreateQueueRequest
         {
             QueueName = _options.Name,
             Attributes = GetQueueTypeAttributes()
         };
 
-        if (_options.SqsManagedSseEnabled)
+        _queueSetupPending = _options.SupportDeadLetter;
+        string queueUrl;
+        try
         {
-            createQueueRequest.Attributes[QueueAttributeName.SqsManagedSseEnabled] = "true";
+            var createQueueResponse = await _client.Value.CreateQueueAsync(createQueueRequest).AnyContext();
+            queueUrl = createQueueResponse.QueueUrl;
         }
-        else if (!String.IsNullOrEmpty(_options.KmsMasterKeyId))
+        catch (QueueNameExistsException)
         {
-            createQueueRequest.Attributes[QueueAttributeName.KmsMasterKeyId] = _options.KmsMasterKeyId;
-            createQueueRequest.Attributes[QueueAttributeName.KmsDataKeyReusePeriodSeconds] = _options.KmsDataKeyReusePeriodSeconds.ToString();
+            // Another party created the queue with different attributes; the next call uses it as an existing queue
+            // instead of retrying a CreateQueue that can't succeed.
+            _queueSetupPending = false;
+            throw;
         }
-
-        var createQueueResponse = await _client.Value.CreateQueueAsync(createQueueRequest).AnyContext();
-        _queueUrl = createQueueResponse.QueueUrl;
 
         if (!_options.SupportDeadLetter)
+        {
+            _queueUrl = queueUrl;
             return;
+        }
 
-        // step 2, create dead letter queue
+        // step 2, create dead letter queue with the same encryption as the source queue
         var createDeadRequest = new CreateQueueRequest
         {
-            QueueName = GetDeadLetterQueueName(),
+            QueueName = deadLetterName,
             Attributes = GetQueueTypeAttributes()
         };
-        var createDeadResponse = await _client.Value.CreateQueueAsync(createDeadRequest).AnyContext();
-        _deadUrl = createDeadResponse.QueueUrl;
-        _ownsDeadLetterQueue = true;
+        string deadLetterUrl;
+        try
+        {
+            var createDeadResponse = await _client.Value.CreateQueueAsync(createDeadRequest).AnyContext();
+            deadLetterUrl = createDeadResponse.QueueUrl;
+        }
+        catch (QueueNameExistsException ex)
+        {
+            // A dead letter queue left by an earlier version can have different attributes (for example no encryption);
+            // keep using it rather than failing queue creation.
+            _logger.LogWarning(ex, "Dead letter queue {DeadLetterQueueName} already exists with different attributes; using it as-is", deadLetterName);
+            deadLetterUrl = (await _client.Value.GetQueueUrlAsync(deadLetterName).AnyContext()).QueueUrl;
+        }
+
+        _deadLetterQueue = new DeadLetterQueue(deadLetterName, deadLetterUrl);
+        _createdDeadLetterUrl = deadLetterUrl;
 
         // step 3, get dead letter attributes
         var attributeNames = new List<string> { QueueAttributeName.QueueArn };
-        var deadAttributeRequest = new GetQueueAttributesRequest(_deadUrl, attributeNames);
+        var deadAttributeRequest = new GetQueueAttributesRequest(deadLetterUrl, attributeNames);
         var deadAttributeResponse = await _client.Value.GetQueueAttributesAsync(deadAttributeRequest).AnyContext();
 
         int maxReceiveCount = Math.Max(_options.Retries + 1, 1);
@@ -475,15 +578,53 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             [QueueAttributeName.RedrivePolicy] = redrivePolicy.ToJsonString()
         };
 
-        var setAttributeRequest = new SetQueueAttributesRequest(_queueUrl, attributes);
+        var setAttributeRequest = new SetQueueAttributesRequest(queueUrl, attributes);
         await _client.Value.SetQueueAttributesAsync(setAttributeRequest).AnyContext();
+        _deadLetterCreatedUtc = _timeProvider.GetUtcNow();
+        _queueSetupPending = false;
+        _queueUrl = queueUrl;
+    }
+
+    /// <summary>
+    /// A queue this instance just created may not report its redrive policy yet, so during that window an empty policy
+    /// falls back to the dead letter queue it created instead of deleting messages; afterwards a removed policy is honored.
+    /// Callers capture this before reading the policy so a read that started inside the window keeps the fallback.
+    /// </summary>
+    private string? GetPropagationFallbackUrl()
+    {
+        return _deadLetterCreatedUtc is { } createdUtc && _timeProvider.GetUtcNow() - createdUtc < QueueAttributePropagationWindow
+            ? _createdDeadLetterUrl
+            : null;
+    }
+
+    private async Task<string?> FindQueueUrlAsync(string queueName)
+    {
+        try
+        {
+            var response = await _client.Value.GetQueueUrlAsync(queueName).AnyContext();
+            return response.QueueUrl;
+        }
+        catch (QueueDoesNotExistException)
+        {
+            return null;
+        }
     }
 
     private Dictionary<string, string> GetQueueTypeAttributes()
     {
         var attributes = new Dictionary<string, string>();
-        if (IsFifo)
+        if (_isFifo)
             attributes[QueueAttributeName.FifoQueue] = "true";
+
+        if (_options.SqsManagedSseEnabled)
+        {
+            attributes[QueueAttributeName.SqsManagedSseEnabled] = "true";
+        }
+        else if (!String.IsNullOrEmpty(_options.KmsMasterKeyId))
+        {
+            attributes[QueueAttributeName.KmsMasterKeyId] = _options.KmsMasterKeyId;
+            attributes[QueueAttributeName.KmsDataKeyReusePeriodSeconds] = _options.KmsDataKeyReusePeriodSeconds.ToString();
+        }
 
         return attributes;
     }
@@ -493,43 +634,69 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     /// </summary>
     private string GetDeadLetterQueueName()
     {
-        return IsFifo
+        return _isFifo
             ? _options.Name[..^FifoQueueSuffix.Length] + "-deadletter" + FifoQueueSuffix
             : _options.Name + "-deadletter";
     }
 
     /// <summary>
-    /// Resolves the dead letter queue from the source queue's redrive policy when this instance did not create the queue.
-    /// A missing redrive policy is checked again on the next call. Lookup failures propagate so exhausted messages are retained.
-    /// Only a dead letter queue that follows the <c>{name}-deadletter</c> convention is deleted by <see cref="QueueBase{T,TOptions}.DeleteQueueAsync"/>.
+    /// Resolves the dead letter queue from the source queue's current redrive policy, so a policy that is added, changed or
+    /// removed while this instance is running is honored. The URL is cached per dead letter queue name, so an unchanged
+    /// policy costs no <c>GetQueueUrl</c> call. Lookup failures propagate so exhausted messages are retained.
+    /// Resolving a queue here doesn't make it owned: <see cref="QueueBase{T,TOptions}.DeleteQueueAsync"/> re-reads the policy before deleting one it didn't create.
     /// </summary>
-    private async Task EnsureDeadLetterUrlAsync(IDictionary<string, string>? queueAttributes = null)
+    private async Task<string?> ResolveDeadLetterUrlAsync()
     {
-        if (!String.IsNullOrEmpty(_deadUrl))
-            return;
+        var attributeNames = new List<string> { QueueAttributeName.RedrivePolicy };
+        var request = new GetQueueAttributesRequest(_queueUrl, attributeNames);
+        // Captured before the read so a read that started inside the propagation window keeps the fallback.
+        string? propagationFallbackUrl = GetPropagationFallbackUrl();
+        GetQueueAttributesResponse response;
+        try
+        {
+            response = await _client.Value.GetQueueAttributesAsync(request).AnyContext();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            ForgetQueueUrl(request.QueueUrl);
+            throw;
+        }
+        catch (AmazonServiceException ex)
+        {
+            _logger.LogWarning(ex, "Unable to read the redrive policy for {QueueName}: {Message}", _options.Name, ex.Message);
+            throw;
+        }
 
+        return await ResolveDeadLetterUrlAsync(response.Attributes, propagationFallbackUrl).AnyContext();
+    }
+
+    /// <summary>
+    /// Resolves the dead letter queue from source queue attributes the caller already read.
+    /// </summary>
+    /// <param name="queueAttributes">Source queue attributes the caller already read.</param>
+    /// <param name="propagationFallbackUrl">The <see cref="GetPropagationFallbackUrl"/> result captured before
+    /// <paramref name="queueAttributes"/> were read.</param>
+    private async Task<string?> ResolveDeadLetterUrlAsync(IDictionary<string, string> queueAttributes, string? propagationFallbackUrl)
+    {
         string? deadLetterName = null;
         try
         {
-            if (queueAttributes is null)
-            {
-                var attributeNames = new List<string> { QueueAttributeName.RedrivePolicy };
-                var response = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(_queueUrl, attributeNames)).AnyContext();
-                queueAttributes = response.Attributes;
-            }
-
             deadLetterName = queueAttributes.DeadLetterQueue();
             if (String.IsNullOrEmpty(deadLetterName))
-                return;
+                return propagationFallbackUrl;
+
+            var cached = _deadLetterQueue;
+            if (cached is not null && String.Equals(cached.Name, deadLetterName, StringComparison.Ordinal))
+                return cached.Url;
 
             var deadResponse = await _client.Value.GetQueueUrlAsync(deadLetterName).AnyContext();
             if (String.IsNullOrEmpty(deadResponse.QueueUrl))
                 throw new QueueException($"Unable to resolve dead letter queue {deadLetterName} for {_options.Name}.");
 
-            _ownsDeadLetterQueue = String.Equals(deadLetterName, GetDeadLetterQueueName(), StringComparison.Ordinal);
-            _deadUrl = deadResponse.QueueUrl;
+            _deadLetterQueue = new DeadLetterQueue(deadLetterName, deadResponse.QueueUrl);
+            return deadResponse.QueueUrl;
         }
-        catch (AmazonServiceException ex)
+        catch (Exception ex) when (ex is AmazonServiceException or JsonException)
         {
             _logger.LogWarning(ex, "Unable to resolve dead letter queue {DeadLetterQueueName} for {QueueName}: {Message}", deadLetterName, _options.Name, ex.Message);
             throw;
@@ -537,22 +704,25 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     }
 
     /// <summary>
-    /// Validates the options against SQS limits. Runs before <see cref="QueueBase{T,TOptions}.Enqueuing"/> handlers so known
-    /// option violations are rejected before behaviors such as duplicate detection reserve state, and again after them
-    /// because handlers may change the options.
+    /// Validates the options against SQS limits. The SQS emulators don't enforce these limits, and checking them here fails
+    /// before <see cref="QueueBase{T,TOptions}.Enqueuing"/> handlers such as duplicate detection reserve state. It runs again
+    /// after the handlers because they may change the options. The checks don't allocate.
     /// </summary>
     private void ValidateEntryOptions(QueueEntryOptions options)
     {
         ValidateSqsId(options.GroupId, nameof(QueueEntryOptions.GroupId));
-        CreateMessageAttributes(options);
 
-        if (!IsFifo)
+        int attributeCount = CountMessageAttributes(options);
+        if (attributeCount > MaxMessageAttributes)
+            throw new QueueException($"SQS allows at most {MaxMessageAttributes} message attributes per message (including CorrelationId and TraceState), but {attributeCount} were provided.");
+
+        if (!_isFifo)
             return;
 
         if (String.IsNullOrEmpty(options.GroupId))
             throw new QueueException($"A GroupId is required when enqueuing to the FIFO queue {_options.Name}.");
 
-        if (options.DeliveryDelay.HasValue)
+        if (options.DeliveryDelay > TimeSpan.Zero)
             throw new QueueException($"FIFO queue {_options.Name} does not support per-message delivery delays; configure DelaySeconds on the queue instead.");
 
         if (!String.IsNullOrEmpty(options.UniqueId))
@@ -578,20 +748,49 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     }
 
     /// <summary>
-    /// Builds the SQS message attributes (custom properties plus <c>CorrelationId</c>) and enforces the SQS limit of
-    /// <see cref="MaxMessageAttributes"/> attributes per message. SQS attribute names are case-sensitive.
+    /// Counts the attributes <see cref="CreateMessageAttributes"/> would send. SQS attribute names are case-sensitive, so a
+    /// property only replaces <c>CorrelationId</c> when its name matches exactly.
     /// </summary>
-    private static Dictionary<string, MessageAttributeValue> CreateMessageAttributes(QueueEntryOptions options)
+    private static int CountMessageAttributes(QueueEntryOptions options)
     {
-        var attributes = new Dictionary<string, MessageAttributeValue>(StringComparer.Ordinal);
+        int count = options.Properties.Count;
+        if (!String.IsNullOrEmpty(options.CorrelationId) && !HasCorrelationIdProperty(options.Properties))
+            count++;
+
+        return count;
+    }
+
+    /// <summary>
+    /// Compares keys ordinally rather than with <see cref="IDictionary{TKey,TValue}.ContainsKey"/>, because the caller's
+    /// dictionary may be case-insensitive while SQS attribute names are not.
+    /// </summary>
+    private static bool HasCorrelationIdProperty(IDictionary<string, string> properties)
+    {
+        foreach (string key in properties.Keys)
+        {
+            if (String.Equals(key, AttributeExtensions.CorrelationIdAttributeName, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Builds the SQS message attributes (custom properties plus <c>CorrelationId</c>), or <c>null</c> when there are none.
+    /// <see cref="ValidateEntryOptions"/> enforces the attribute limit.
+    /// </summary>
+    private static Dictionary<string, MessageAttributeValue>? CreateMessageAttributes(QueueEntryOptions options)
+    {
+        bool hasCorrelationId = !String.IsNullOrEmpty(options.CorrelationId);
+        if (options.Properties.Count is 0 && !hasCorrelationId)
+            return null;
+
+        var attributes = new Dictionary<string, MessageAttributeValue>(options.Properties.Count + 1, StringComparer.Ordinal);
         foreach (var property in options.Properties)
-            attributes[property.Key] = new MessageAttributeValue { DataType = "String", StringValue = property.Value };
+            attributes[property.Key] = new MessageAttributeValue { DataType = "String", StringValue = property.Value }; // TODO: Support more than string data types
 
-        if (!String.IsNullOrEmpty(options.CorrelationId))
-            attributes["CorrelationId"] = new MessageAttributeValue { DataType = "String", StringValue = options.CorrelationId };
-
-        if (attributes.Count > MaxMessageAttributes)
-            throw new QueueException($"SQS allows at most {MaxMessageAttributes} message attributes per message (including CorrelationId and TraceState), but {attributes.Count} were provided.");
+        if (hasCorrelationId)
+            attributes[AttributeExtensions.CorrelationIdAttributeName] = new MessageAttributeValue { DataType = "String", StringValue = options.CorrelationId };
 
         return attributes;
     }
@@ -600,32 +799,172 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     {
         _logger.LogInformation("Exceeded retry limit ({Attempts}/{Retries}), moving message {QueueEntryId} to dead letter", entry.Attempts, _options.Retries, entry.Id);
 
-        if (_options.SupportDeadLetter)
-            await EnsureDeadLetterUrlAsync().AnyContext();
-
-        if (_options.SupportDeadLetter && !String.IsNullOrEmpty(_deadUrl))
+        var message = entry.UnderlyingMessage;
+        string? deadLetterUrl = _options.SupportDeadLetter ? await ResolveDeadLetterUrlAsync().AnyContext() : null;
+        if (deadLetterUrl is not null)
         {
-            var deadMessage = new SendMessageRequest
+            await _client.Value.SendMessageAsync(new SendMessageRequest
             {
-                QueueUrl = _deadUrl,
-                MessageBody = entry.UnderlyingMessage.Body
-            };
-
-            if (entry.UnderlyingMessage.MessageAttributes is { Count: > 0 })
-                deadMessage.MessageAttributes = new Dictionary<string, MessageAttributeValue>(entry.UnderlyingMessage.MessageAttributes);
-
-            string? groupId = entry.UnderlyingMessage.Attributes.MessageGroupId();
-            if (!String.IsNullOrEmpty(groupId))
-                deadMessage.MessageGroupId = groupId;
-
-            if (IsFifo)
-                deadMessage.MessageDeduplicationId = entry.UnderlyingMessage.MessageId;
-
-            await _client.Value.SendMessageAsync(deadMessage).AnyContext();
+                QueueUrl = deadLetterUrl,
+                MessageBody = message.Body,
+                // The received attribute dictionary is owned by this entry, which is deleted below, so it is reused rather than copied.
+                MessageAttributes = message.MessageAttributes is { Count: > 0 } ? message.MessageAttributes : null,
+                MessageGroupId = message.Attributes.MessageGroupId(),
+                MessageDeduplicationId = _isFifo ? message.MessageId : null
+            }).AnyContext();
+        }
+        else
+        {
+            _logger.LogWarning("No dead letter queue is configured for {QueueName}; discarding message {QueueEntryId}", _options.Name, entry.Id);
         }
 
-        await _client.Value.DeleteMessageAsync(_queueUrl, entry.UnderlyingMessage.ReceiptHandle).AnyContext();
+        await _client.Value.DeleteMessageAsync(_queueUrl, message.ReceiptHandle).AnyContext();
     }
+
+    /// <summary>
+    /// Sets the <c>MessageDeduplicationId</c> of a FIFO message: the caller's <see cref="QueueEntryOptions.UniqueId"/>, or a
+    /// generated id unless the queue derives one from the message body. SQS requires an id unless ContentBasedDeduplication is enabled.
+    /// </summary>
+    /// <returns><c>true</c> when no id was set because the queue uses content-based deduplication.</returns>
+    private async Task<bool> SetFifoDeduplicationIdAsync(SendMessageRequest message, QueueEntryOptions options)
+    {
+        if (!String.IsNullOrEmpty(options.UniqueId))
+        {
+            message.MessageDeduplicationId = options.UniqueId;
+            return false;
+        }
+
+        if (!_contentBasedDeduplicationResolved)
+            await ResolveContentBasedDeduplicationAsync(message.QueueUrl).AnyContext();
+
+        if (_contentBasedDeduplication)
+            return true;
+
+        message.MessageDeduplicationId = Guid.NewGuid().ToString("N");
+        return false;
+    }
+
+    /// <summary>
+    /// Reads the queue's ContentBasedDeduplication setting once per queue url, on the first FIFO send without a
+    /// <see cref="QueueEntryOptions.UniqueId"/>, so instances that only consume or always set a UniqueId never read it.
+    /// An explicit <c>MessageDeduplicationId</c> overrides content-based deduplication, so one is only generated when the
+    /// queue doesn't derive it from the message body
+    /// (<see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html">SendMessage</see>).
+    /// </summary>
+    /// <remarks>
+    /// The setting isn't polled. If it is turned off later, SQS rejects the send and it is retried with a generated id
+    /// (see <see cref="IsMissingDeduplicationIdError"/>). If it is turned on later, generated ids keep being sent, which is
+    /// valid but bypasses content-based deduplication until the queue is reopened. If the read fails (for example a missing
+    /// <c>sqs:GetQueueAttributes</c> permission), the next send omits the id and the outcome settles the setting: it succeeds
+    /// when content-based deduplication is enabled, and otherwise is rejected and retried with a generated id. A failed read
+    /// therefore costs one warning, not a call per send, and doesn't disable content-based deduplication.
+    /// </remarks>
+    private async Task ResolveContentBasedDeduplicationAsync(string queueUrl)
+    {
+        try
+        {
+            var response = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(queueUrl, [QueueAttributeName.ContentBasedDeduplication])).AnyContext();
+            _contentBasedDeduplication = response.Attributes.TryGetValue(QueueAttributeName.ContentBasedDeduplication, out string? value)
+                && Boolean.TryParse(value, out bool enabled) && enabled;
+            _logger.LogDebug("Queue {QueueName} ContentBasedDeduplication is {ContentBasedDeduplication}", _options.Name, _contentBasedDeduplication);
+        }
+        catch (QueueDoesNotExistException)
+        {
+            ForgetQueueUrl(queueUrl);
+            throw;
+        }
+        catch (AmazonSQSException ex)
+        {
+            _contentBasedDeduplication = true;
+            _logger.LogWarning(ex, "Unable to read ContentBasedDeduplication for queue {QueueName}; the next send determines it: {Message}", _options.Name, ex.Message);
+        }
+
+        _contentBasedDeduplicationResolved = true;
+    }
+
+    /// <summary>
+    /// SQS rejects a FIFO message without a deduplication id once content-based deduplication has been turned off.
+    /// </summary>
+    private static bool IsMissingDeduplicationIdError(AmazonSQSException ex)
+    {
+        return ex.ErrorCode is "InvalidParameterValue" && ex.Message.Contains("ContentBasedDeduplication", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// SQS deletes a queue asynchronously, so a url resolved while it was being deleted can be cached. Forget it once SQS
+    /// reports the queue is gone so the next call resolves or recreates the queue instead of failing until restart.
+    /// </summary>
+    private void ForgetQueueUrl(string? queueUrl)
+    {
+        if (queueUrl is not null && Interlocked.CompareExchange(ref _queueUrl, null, queueUrl) == queueUrl)
+            _contentBasedDeduplicationResolved = false;
+    }
+
+    /// <summary>
+    /// Returns the dead letter queue the source queue's current redrive policy targets, but only when it follows the
+    /// <c>{name}-deadletter</c> convention, so a shared or externally managed queue is never treated as owned. A queue
+    /// that merely has the conventional name isn't enough: the source must point at it.
+    /// </summary>
+    /// <remarks>
+    /// A failure (for example a principal allowed to delete queues but not to read their attributes) only skips the
+    /// dead letter queue, so the source queue is still deleted.
+    /// </remarks>
+    private async Task<string?> FindPolicyDeadLetterUrlAsync(string queueUrl)
+    {
+        string ownedName = GetDeadLetterQueueName();
+        try
+        {
+            var response = await _client.Value.GetQueueAttributesAsync(new GetQueueAttributesRequest(queueUrl, [QueueAttributeName.RedrivePolicy])).AnyContext();
+            string? deadLetterName = response.Attributes.DeadLetterQueue();
+            if (!String.Equals(deadLetterName, ownedName, StringComparison.Ordinal))
+            {
+                _logger.LogDebug("Dead letter queue {DeadLetterQueueName} of {QueueName} is not owned by this queue; it is not deleted", deadLetterName, _options.Name);
+                return null;
+            }
+
+            return await FindQueueUrlAsync(ownedName).AnyContext();
+        }
+        catch (QueueDoesNotExistException)
+        {
+            return null;
+        }
+        catch (Exception ex) when (ex is AmazonServiceException or JsonException)
+        {
+            _logger.LogWarning(ex, "Unable to confirm the dead letter queue {DeadLetterQueueName} of {QueueName}; it is not deleted: {Message}", ownedName, _options.Name, ex.Message);
+            return null;
+        }
+    }
+
+    private async Task DeleteQueueIfExistsAsync(string queueUrl, string queueName)
+    {
+        try
+        {
+            await _client.Value.DeleteQueueAsync(queueUrl).AnyContext();
+            _logger.LogDebug("Deleted queue {QueueName}", queueName);
+        }
+        catch (QueueDoesNotExistException)
+        {
+            _logger.LogDebug("Queue {QueueName} was already deleted", queueName);
+        }
+    }
+
+    private QueueStats CreateQueueStats(long queued, long working, long deadletter = 0)
+    {
+        return new QueueStats
+        {
+            Queued = queued,
+            Working = working,
+            Deadletter = deadletter,
+            Enqueued = _enqueuedCount,
+            Dequeued = _dequeuedCount,
+            Completed = _completedCount,
+            Abandoned = _abandonedCount,
+            Errors = WorkerErrorCount,
+            Timeouts = 0
+        };
+    }
+
+    private sealed record DeadLetterQueue(string Name, string Url);
 
     private static SQSQueueEntry<T> ToQueueEntry(IQueueEntry<T> entry)
     {

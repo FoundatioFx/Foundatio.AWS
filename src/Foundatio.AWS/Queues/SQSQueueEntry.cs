@@ -13,7 +13,7 @@ public class SQSQueueEntry<T>
     {
         if (message.MessageAttributes is not null)
         {
-            foreach (var property in message.MessageAttributes.Where(a => a.Key != "CorrelationId"))
+            foreach (var property in message.MessageAttributes.Where(a => a.Key != AttributeExtensions.CorrelationIdAttributeName))
                 Properties.Add(property.Key, property.Value.StringValue);
         }
 

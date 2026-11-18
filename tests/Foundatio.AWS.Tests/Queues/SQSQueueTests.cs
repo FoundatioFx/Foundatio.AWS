@@ -1,8 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Amazon.SQS;
 using Amazon.SQS.Model;
+using Foundatio.Caching;
 using Foundatio.Queues;
 using Foundatio.Serializer;
 using Foundatio.Tests.Queue;
@@ -23,25 +27,33 @@ public class SQSQueueTests : QueueTestBase
 
     protected override IQueue<SimpleWorkItem>? GetQueue(int retries = 1, TimeSpan? workItemTimeout = null,
         TimeSpan? retryDelay = null, int[]? retryMultipliers = null, int deadLetterMaxItems = 100,
-        bool runQueueMaintenance = true, TimeProvider? timeProvider = null, ISerializer? serializer = null)
+        bool runQueueMaintenance = true, TimeProvider? timeProvider = null, ISerializer? serializer = null,
+        Func<SimpleWorkItem, string?>? groupIdResolver = null)
     {
-        var queue = new SQSQueue<SimpleWorkItem>(o => o
-            .ConnectionString("serviceurl=http://localhost:4566;AccessKey=xxx;SecretKey=xxx")
-            .Name(_queueName)
-            .Retries(retries)
-            .RetryDelay(attempt =>
-            {
-                int[] multipliers = retryMultipliers ?? [1, 3, 5, 10];
-                int index = Math.Min(attempt, multipliers.Length - 1);
-                return TimeSpan.FromSeconds(multipliers[index]);
-            })
-            .WorkItemTimeout(workItemTimeout.GetValueOrDefault(TimeSpan.FromMinutes(5)))
-            .DequeueInterval(TimeSpan.FromSeconds(1))
-            .ReadQueueTimeout(TimeSpan.FromSeconds(1))
-            .MetricsPollingInterval(TimeSpan.Zero)
-            .TimeProvider(timeProvider)
-            .Serializer(serializer)
-            .LoggerFactory(Log));
+        var queue = new SQSQueue<SimpleWorkItem>(o =>
+        {
+            o.ConnectionString("serviceurl=http://localhost:4566;AccessKey=xxx;SecretKey=xxx")
+                .Name(_queueName)
+                .Retries(retries)
+                .RetryDelay(attempt =>
+                {
+                    int[] multipliers = retryMultipliers ?? [1, 3, 5, 10];
+                    int index = Math.Min(attempt, multipliers.Length - 1);
+                    return TimeSpan.FromSeconds(multipliers[index]);
+                })
+                .WorkItemTimeout(workItemTimeout.GetValueOrDefault(TimeSpan.FromMinutes(5)))
+                .DequeueInterval(TimeSpan.FromSeconds(1))
+                .ReadQueueTimeout(TimeSpan.FromSeconds(1))
+                .MetricsPollingInterval(TimeSpan.Zero)
+                .TimeProvider(timeProvider)
+                .Serializer(serializer)
+                .LoggerFactory(Log);
+
+            if (groupIdResolver is not null)
+                o.GroupId(groupIdResolver);
+
+            return o;
+        });
 
         _logger.LogDebug("Queue Id: {QueueId}", queue.QueueId);
         return queue;
@@ -185,6 +197,54 @@ public class SQSQueueTests : QueueTestBase
         return base.EnqueueAsync_WithReusedOptions_DoesNotChangeCallerOptionsAsync();
     }
 
+    [Fact]
+    public override Task EnqueueAsync_WhenResolverReturnsEmpty_EnqueuesWithoutGroupAsync()
+    {
+        return base.EnqueueAsync_WhenResolverReturnsEmpty_EnqueuesWithoutGroupAsync();
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WhenResolverReturnsNull_EnqueuesWithoutGroupAsync()
+    {
+        return base.EnqueueAsync_WhenResolverReturnsNull_EnqueuesWithoutGroupAsync();
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WithActivity_AppliesCorrelationBeforeEnqueuingHandlersAsync()
+    {
+        return base.EnqueueAsync_WithActivity_AppliesCorrelationBeforeEnqueuingHandlersAsync();
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WithEmptyGroupIdAndResolver_UsesPayloadValueAsync()
+    {
+        return base.EnqueueAsync_WithEmptyGroupIdAndResolver_UsesPayloadValueAsync();
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WithExplicitGroupId_OverridesResolverAsync()
+    {
+        return base.EnqueueAsync_WithExplicitGroupId_OverridesResolverAsync();
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WithGroupIdResolver_DoesNotChangeCallerOptionsAsync()
+    {
+        return base.EnqueueAsync_WithGroupIdResolver_DoesNotChangeCallerOptionsAsync();
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WithGroupIdResolver_UsesPayloadValueAsync()
+    {
+        return base.EnqueueAsync_WithGroupIdResolver_UsesPayloadValueAsync();
+    }
+
+    [Fact]
+    public override Task EnqueueAsync_WithReusedOptionsAndGroupIdResolver_EnqueuesEachMessageAsync()
+    {
+        return base.EnqueueAsync_WithReusedOptionsAndGroupIdResolver_EnqueuesEachMessageAsync();
+    }
+
     [Fact(Skip = "SQS does not support custom entry IDs")]
     public override Task EnqueueAsync_WithUniqueId_UsesProvidedIdAsync()
     {
@@ -216,12 +276,6 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
-    public override Task CanHandleErrorInWorkerAsync()
-    {
-        return base.CanHandleErrorInWorkerAsync();
-    }
-
-    [Fact]
     public override Task StartWorkingAsync_WhenDequeueThrows_KeepsWorkingAsync()
     {
         return base.StartWorkingAsync_WhenDequeueThrows_KeepsWorkingAsync();
@@ -237,6 +291,12 @@ public class SQSQueueTests : QueueTestBase
     public override Task StartWorkingAsync_WhenCancelled_StopsWithoutWorkerErrorsAsync()
     {
         return base.StartWorkingAsync_WhenCancelled_StopsWithoutWorkerErrorsAsync();
+    }
+
+    [Fact]
+    public override Task CanHandleErrorInWorkerAsync()
+    {
+        return base.CanHandleErrorInWorkerAsync();
     }
 
     [Fact]
@@ -370,7 +430,9 @@ public class SQSQueueTests : QueueTestBase
     [Fact]
     public async Task CanGetQueueItemWithDeliveryDelayAndEnsureMessageNotMarkedWorkingWhileWaiting()
     {
-        var queue = GetQueue(dequeueInterval: TimeSpan.Zero, readQueueTimeout: TimeSpan.FromSeconds(2));
+        // The SDK can't abort a long poll, so a dequeue can run one poll past its timeout. A poll shorter than half the
+        // delivery delay keeps the first dequeue from receiving the delayed message.
+        var queue = GetQueue(dequeueInterval: TimeSpan.Zero, readQueueTimeout: TimeSpan.FromSeconds(1));
         if (queue == null)
             return;
 
@@ -650,6 +712,31 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
+    public async Task EnqueueAsync_WithZeroDeliveryDelayOnFifoQueue_EnqueuesAsync()
+    {
+        // Arrange
+        var queue = GetNamedQueue(GetFifoQueueName());
+        var options = new QueueEntryOptions { GroupId = "tenant-1", DeliveryDelay = TimeSpan.Zero };
+
+        try
+        {
+            // Act
+            string? id = await queue.EnqueueAsync(new SimpleWorkItem { Data = "test" }, options);
+
+            // Assert
+            Assert.NotNull(id);
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+            Assert.Equal("test", entry.Value.Data);
+            await entry.CompleteAsync();
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
     public async Task EnqueueAsync_WithDuplicateUniqueIdOnFifoQueue_DeliversOnceAsync()
     {
         // Arrange
@@ -764,6 +851,7 @@ public class SQSQueueTests : QueueTestBase
             var sqsEntry = Assert.IsType<SQSQueueEntry<SimpleWorkItem>>(entry);
             Assert.Equal("tenant-123", sqsEntry.UnderlyingMessage.Attributes["MessageGroupId"]);
             Assert.Equal("tenant-123", sqsEntry.GroupId);
+            Assert.Empty(sqsEntry.Properties);
             await sqsEntry.CompleteAsync();
         }
         finally
@@ -969,9 +1057,596 @@ public class SQSQueueTests : QueueTestBase
         }
     }
 
+    [Fact]
+    public async Task AbandonAsync_WhenDeadletterQueueIsMissing_RetainsMessageAsync()
+    {
+        // Arrange
+        string deadLetterName = _queueName + "-missing";
+        using (var creatingQueue = GetNamedQueue(_queueName, supportDeadLetter: false))
+            await creatingQueue.EnqueueAsync(new SimpleWorkItem { Data = "retained" });
+
+        var queue = GetNamedQueue(_queueName, retries: 0);
+        string? deadLetterUrl = null;
+
+        try
+        {
+            await SetRedrivePolicyAsync(queue, _queueName, deadLetterName);
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+
+            // Act
+            await Assert.ThrowsAnyAsync<AmazonSQSException>(() => entry.AbandonAsync());
+
+            // Assert
+            Assert.False(entry.IsAbandoned);
+            deadLetterUrl = (await queue.Client.CreateQueueAsync(deadLetterName, TestCancellationToken)).QueueUrl;
+            await entry.AbandonAsync();
+            Assert.True(entry.IsAbandoned);
+            Assert.Contains("retained", await ReceiveBodyAsync(queue, deadLetterUrl));
+        }
+        finally
+        {
+            if (deadLetterUrl is not null)
+                await queue.Client.DeleteQueueAsync(deadLetterUrl, TestCancellationToken);
+
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task AbandonAsync_WhenRedrivePolicyIsAddedOrChanged_UsesCurrentDeadletterQueueAsync()
+    {
+        // Arrange
+        using (var creatingQueue = GetNamedQueue(_queueName, supportDeadLetter: false))
+        {
+            for (int i = 0; i < 3; i++)
+                await creatingQueue.EnqueueAsync(new SimpleWorkItem { Data = "item-" + i });
+        }
+
+        var queue = GetNamedQueue(_queueName, retries: 0);
+        string firstDeadLetterUrl = (await queue.Client.CreateQueueAsync(_queueName + "-first", TestCancellationToken)).QueueUrl;
+        string secondDeadLetterUrl = (await queue.Client.CreateQueueAsync(_queueName + "-second", TestCancellationToken)).QueueUrl;
+
+        try
+        {
+            var withoutPolicy = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(withoutPolicy);
+            await withoutPolicy.AbandonAsync();
+
+            await SetRedrivePolicyAsync(queue, _queueName, _queueName + "-first");
+            var afterAdd = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(afterAdd);
+            await afterAdd.AbandonAsync();
+
+            await SetRedrivePolicyAsync(queue, _queueName, _queueName + "-second");
+            var afterChange = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(afterChange);
+
+            // Act
+            await afterChange.AbandonAsync();
+
+            // Assert
+            Assert.Equal(afterAdd.Value.Data, Deserialize(await ReceiveBodyAsync(queue, firstDeadLetterUrl)));
+            Assert.Equal(afterChange.Value.Data, Deserialize(await ReceiveBodyAsync(queue, secondDeadLetterUrl)));
+            Assert.Null(await queue.DequeueAsync(TimeSpan.FromSeconds(1)));
+        }
+        finally
+        {
+            await queue.Client.DeleteQueueAsync(firstDeadLetterUrl, TestCancellationToken);
+            await queue.Client.DeleteQueueAsync(secondDeadLetterUrl, TestCancellationToken);
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task StartWorkingAsync_AfterQueueDeletedExternally_RecreatesQueueAndProcessesMessageAsync()
+    {
+        // Arrange
+        using var workerCancellation = CancellationTokenSource.CreateLinkedTokenSource(TestCancellationToken);
+        workerCancellation.CancelAfter(TimeSpan.FromSeconds(30));
+        var queue = GetNamedQueue(_queueName, supportDeadLetter: false);
+        var completed = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "before" });
+            var url = (await queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken)).QueueUrl;
+            await queue.Client.DeleteQueueAsync(url, TestCancellationToken);
+
+            // Act
+            await queue.StartWorkingAsync(async (entry, _) =>
+            {
+                await entry.CompleteAsync();
+                completed.TrySetResult(entry.Value.Data);
+            }, cancellationToken: workerCancellation.Token);
+            var list = new ListQueuesRequest { QueueNamePrefix = _queueName };
+            while ((await queue.Client.ListQueuesAsync(list, workerCancellation.Token)).QueueUrls is not { Count: > 0 })
+                await Task.Delay(TimeSpan.FromMilliseconds(100), workerCancellation.Token);
+            await queue.Client.SendMessageAsync(url, """{"Data":"after"}""", workerCancellation.Token);
+
+            // Assert
+            Assert.Equal("after", await completed.Task.WaitAsync(workerCancellation.Token));
+        }
+        finally
+        {
+            await workerCancellation.CancelAsync();
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StartWorkingAsync_WhenDeadletterQueueIsMissing_KeepsWorkingAndRetriesAsync(bool exhaustedBeforeDequeue)
+    {
+        // Arrange
+        string deadLetterName = _queueName + "-missing";
+        using (var creatingQueue = GetNamedQueue(_queueName, supportDeadLetter: false))
+            await creatingQueue.EnqueueAsync(new SimpleWorkItem { Data = "retried" });
+
+        var queue = GetNamedQueue(_queueName, retries: 0, workItemTimeout: TimeSpan.FromSeconds(1));
+        string? deadLetterUrl = null;
+        using var workerCancellation = CancellationTokenSource.CreateLinkedTokenSource(TestCancellationToken);
+
+        try
+        {
+            await SetRedrivePolicyAsync(queue, _queueName, deadLetterName);
+
+            if (exhaustedBeforeDequeue)
+            {
+                var url = (await queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken)).QueueUrl;
+                var receive = new ReceiveMessageRequest { QueueUrl = url, VisibilityTimeout = 0, WaitTimeSeconds = 5 };
+                Assert.Single((await queue.Client.ReceiveMessageAsync(receive, TestCancellationToken)).Messages);
+            }
+
+            // Act
+            await queue.StartWorkingAsync((_, _) => throw new InvalidOperationException("Handler failure"), cancellationToken: workerCancellation.Token);
+            string workerError = exhaustedBeforeDequeue ? "Error dequeuing from" : "Worker error abandoning queue entry";
+            for (int i = 0; i < 20 && !Log.LogEntries.Any(e => e.Message.Contains(workerError)); i++)
+                await Task.Delay(TimeSpan.FromMilliseconds(250), TestCancellationToken);
+
+            deadLetterUrl = (await queue.Client.CreateQueueAsync(deadLetterName, TestCancellationToken)).QueueUrl;
+
+            // Assert
+            string? body = null;
+            for (int i = 0; i < 5 && body is null; i++)
+                body = await ReceiveBodyAsync(queue, deadLetterUrl);
+
+            Assert.Contains(Log.LogEntries, e => e.Message.Contains(workerError));
+            Assert.Contains("retried", body);
+        }
+        finally
+        {
+            await workerCancellation.CancelAsync();
+            if (deadLetterUrl is not null)
+                await queue.Client.DeleteQueueAsync(deadLetterUrl, TestCancellationToken);
+
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Theory]
+    [InlineData(10, false)]
+    [InlineData(9, true)]
+    public async Task EnqueueAsync_WithActivityAttributeOverflow_DoesNotReserveDuplicateKeyAsync(int propertyCount, bool traceState)
+    {
+        // Arrange
+        using var activity = new Activity("enqueue").Start();
+        activity.TraceStateString = traceState ? "vendor=value" : null;
+        using var cache = new InMemoryCacheClient();
+        var queue = GetNamedQueue(_queueName);
+        queue.AttachBehavior(new DuplicateDetectionQueueBehavior<SimpleWorkItem>(cache, Log));
+        var options = new QueueEntryOptions();
+        for (int i = 0; i < propertyCount; i++)
+            options.Properties.Add("property" + i, "value");
+
+        try
+        {
+            // Act
+            await Assert.ThrowsAsync<QueueException>(() => queue.EnqueueAsync(new SimpleWorkItem { UniqueIdentifier = "work-item" }, options));
+
+            // Assert
+            Assert.False(await cache.ExistsAsync("work-item"));
+            Assert.Null(await queue.DequeueAsync(TimeSpan.FromSeconds(1)));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WithCaseInsensitivePropertyNames_DoesNotReserveDuplicateKeyAsync()
+    {
+        // Arrange
+        using var cache = new InMemoryCacheClient();
+        var queue = GetNamedQueue(_queueName);
+        queue.AttachBehavior(new DuplicateDetectionQueueBehavior<SimpleWorkItem>(cache, Log));
+        var options = new QueueEntryOptions
+        {
+            CorrelationId = "explicit",
+            Properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["correlationid"] = "property" }
+        };
+        for (int i = 0; i < 9; i++)
+            options.Properties.Add("property" + i, "value");
+
+        try
+        {
+            // Act
+            await Assert.ThrowsAsync<QueueException>(() => queue.EnqueueAsync(new SimpleWorkItem { UniqueIdentifier = "work-item" }, options));
+
+            // Assert
+            Assert.False(await cache.ExistsAsync("work-item"));
+            Assert.Null(await queue.DequeueAsync(TimeSpan.FromSeconds(1)));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EnqueueAsync_WithMetadataNameCollisions_CountsEffectiveAttributesAsync(bool explicitCorrelation)
+    {
+        // Arrange
+        using var activity = new Activity("enqueue").Start();
+        activity.TraceStateString = "vendor=value";
+        var queue = GetNamedQueue(_queueName);
+        var options = new QueueEntryOptions { CorrelationId = explicitCorrelation ? "explicit" : null };
+        options.Properties.Add("CorrelationId", "property-correlation");
+        options.Properties.Add("TraceState", "property-trace");
+        for (int i = 0; i < 8; i++)
+            options.Properties.Add("property" + i, "value");
+        bool enqueuingCalled = false;
+        queue.Enqueuing.AddHandler((_, args) =>
+        {
+            enqueuingCalled = true;
+            args.Cancel = true;
+            return Task.CompletedTask;
+        });
+
+        try
+        {
+            // Act
+            string? id = await queue.EnqueueAsync(new SimpleWorkItem(), options);
+
+            // Assert
+            Assert.Null(id);
+            Assert.True(enqueuingCalled);
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EnqueueAsync_WhenDeadletterNameExceedsSqsLimit_ThrowsBeforeCreatingQueueAsync(bool isFifo)
+    {
+        // Arrange
+        string suffix = isFifo ? ".fifo" : String.Empty;
+        string name = "foundatio-" + new string('a', 80 - "foundatio-".Length - suffix.Length) + suffix;
+        var queue = GetNamedQueue(name);
+
+        try
+        {
+            // Act
+            var exception = await Assert.ThrowsAsync<QueueException>(() => queue.EnqueueAsync(new SimpleWorkItem(), new QueueEntryOptions { GroupId = "group" }));
+
+            // Assert
+            Assert.Contains("exceeds the SQS limit of 80 characters", exception.Message);
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(name, TestCancellationToken));
+        }
+        finally
+        {
+            queue.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task AbandonAsync_WhenCreatedRedrivePolicyIsNotVisibleYet_UsesCreatedDeadletterQueueAsync()
+    {
+        // Arrange
+        var queue = GetNamedQueue(_queueName, retries: 0);
+
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "propagating" });
+            var queueUrl = await queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken);
+            await queue.Client.SetQueueAttributesAsync(queueUrl.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.RedrivePolicy] = "" }, TestCancellationToken);
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+
+            // Act
+            await entry.AbandonAsync();
+
+            // Assert
+            var deadLetterUrl = await queue.Client.GetQueueUrlAsync(_queueName + "-deadletter", TestCancellationToken);
+            Assert.Equal("propagating", Deserialize(await ReceiveBodyAsync(queue, deadLetterUrl.QueueUrl)));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteQueueAsync_OnUnusedInstance_DeletesSourceAndDeadletterQueuesAsync()
+    {
+        // Arrange
+        using (var creatingQueue = GetNamedQueue(_queueName))
+            await creatingQueue.EnqueueAsync(new SimpleWorkItem { Data = "delete" });
+
+        var queue = GetNamedQueue(_queueName);
+
+        try
+        {
+            // Act
+            await queue.DeleteQueueAsync();
+
+            // Assert
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken));
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName + "-deadletter", TestCancellationToken));
+        }
+        finally
+        {
+            queue.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task DeleteQueueAsync_AfterRedrivePolicyRemoved_KeepsResolvedDeadletterQueueAsync()
+    {
+        // Arrange
+        string deadLetterName = _queueName + "-deadletter";
+        var queue = GetNamedQueue(_queueName);
+        var deadLetter = await queue.Client.CreateQueueAsync(deadLetterName, TestCancellationToken);
+        var source = await queue.Client.CreateQueueAsync(_queueName, TestCancellationToken);
+
+        try
+        {
+            // The instance opens the existing queue and resolves the conventional dead letter queue from its policy.
+            await SetRedrivePolicyAsync(queue, _queueName, deadLetterName);
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "test" });
+            var stats = await queue.GetQueueStatsAsync();
+            Assert.Equal(0, stats.Deadletter);
+            await queue.Client.SetQueueAttributesAsync(source.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.RedrivePolicy] = "" }, TestCancellationToken);
+
+            // Act
+            await queue.DeleteQueueAsync();
+
+            // Assert
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken));
+            var deadLetterUrl = await queue.Client.GetQueueUrlAsync(deadLetterName, TestCancellationToken);
+            Assert.Equal(deadLetter.QueueUrl, deadLetterUrl.QueueUrl);
+        }
+        finally
+        {
+            await queue.Client.DeleteQueueAsync(deadLetter.QueueUrl, TestCancellationToken);
+            queue.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeleteQueueAsync_OnUnusedInstanceWithUnrelatedConventionalDeadletterQueue_KeepsItAsync(bool sourceExists)
+    {
+        // Arrange
+        var queue = GetNamedQueue(_queueName);
+        var unrelated = await queue.Client.CreateQueueAsync(_queueName + "-deadletter", TestCancellationToken);
+        if (sourceExists)
+            await queue.Client.CreateQueueAsync(_queueName, TestCancellationToken);
+
+        try
+        {
+            // Act
+            await queue.DeleteQueueAsync();
+
+            // Assert
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken));
+            var unrelatedUrl = await queue.Client.GetQueueUrlAsync(_queueName + "-deadletter", TestCancellationToken);
+            Assert.Equal(unrelated.QueueUrl, unrelatedUrl.QueueUrl);
+        }
+        finally
+        {
+            await queue.Client.DeleteQueueAsync(unrelated.QueueUrl, TestCancellationToken);
+            queue.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_OnFifoQueueWithContentBasedDeduplication_DeduplicatesIdenticalBodiesAsync()
+    {
+        // Arrange
+        string fifoName = GetFifoQueueName();
+        using (var creatingQueue = GetNamedQueue(fifoName, supportDeadLetter: false))
+            await creatingQueue.Client.CreateQueueAsync(new CreateQueueRequest
+            {
+                QueueName = fifoName,
+                Attributes = new Dictionary<string, string>
+                {
+                    [QueueAttributeName.FifoQueue] = "true",
+                    [QueueAttributeName.ContentBasedDeduplication] = "true"
+                }
+            }, TestCancellationToken);
+
+        var queue = GetNamedQueue(fifoName, supportDeadLetter: false);
+
+        try
+        {
+            // Act
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "same" }, new QueueEntryOptions { GroupId = "group" });
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "same" }, new QueueEntryOptions { GroupId = "group" });
+
+            // Assert
+            var first = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(first);
+            await first.CompleteAsync();
+            Assert.Null(await queue.DequeueAsync(TimeSpan.FromSeconds(2)));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WhenContentBasedDeduplicationIsTurnedOff_SendsGeneratedDeduplicationIdAsync()
+    {
+        // Arrange
+        string fifoName = GetFifoQueueName();
+        using (var creatingQueue = GetNamedQueue(fifoName, supportDeadLetter: false))
+            await creatingQueue.Client.CreateQueueAsync(new CreateQueueRequest
+            {
+                QueueName = fifoName,
+                Attributes = new Dictionary<string, string>
+                {
+                    [QueueAttributeName.FifoQueue] = "true",
+                    [QueueAttributeName.ContentBasedDeduplication] = "true"
+                }
+            }, TestCancellationToken);
+
+        var queue = GetNamedQueue(fifoName, supportDeadLetter: false);
+
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "first" }, new QueueEntryOptions { GroupId = "group" });
+            var queueUrl = await queue.Client.GetQueueUrlAsync(fifoName, TestCancellationToken);
+            await queue.Client.SetQueueAttributesAsync(queueUrl.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.ContentBasedDeduplication] = "false" }, TestCancellationToken);
+
+            // Act
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "second" }, new QueueEntryOptions { GroupId = "group" });
+
+            // Assert
+            var first = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(first);
+            await first.CompleteAsync();
+            var second = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(second);
+            Assert.Equal("second", second.Value.Data);
+            await second.CompleteAsync();
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EnqueueAsync_AfterQueueDeletedExternally_RecreatesQueueOnNextCallAsync(bool detectedByStats)
+    {
+        // Arrange
+        var queue = GetNamedQueue(_queueName, supportDeadLetter: false);
+
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "before" });
+            var queueUrl = await queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken);
+            await queue.Client.DeleteQueueAsync(queueUrl.QueueUrl, TestCancellationToken);
+
+            // Act
+            if (detectedByStats)
+                await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.GetQueueStatsAsync());
+            else
+                await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "stale" }));
+
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "after" });
+
+            // Assert
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+            Assert.Equal("after", entry.Value.Data);
+            await entry.CompleteAsync();
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WhenContentBasedDeduplicationIsTurnedOnAfterQueueCreated_DeduplicatesIdenticalBodiesAsync()
+    {
+        // Arrange
+        string fifoName = GetFifoQueueName();
+        var queue = GetNamedQueue(fifoName, supportDeadLetter: false);
+
+        try
+        {
+            Assert.Null(await queue.DequeueAsync(TimeSpan.Zero));
+            var queueUrl = await queue.Client.GetQueueUrlAsync(fifoName, TestCancellationToken);
+            await queue.Client.SetQueueAttributesAsync(queueUrl.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.ContentBasedDeduplication] = "true" }, TestCancellationToken);
+
+            // Act
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "same" }, new QueueEntryOptions { GroupId = "group" });
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "same" }, new QueueEntryOptions { GroupId = "group" });
+
+            // Assert
+            var first = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(first);
+            await first.CompleteAsync();
+            Assert.Null(await queue.DequeueAsync(TimeSpan.FromSeconds(2)));
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WhenFifoQueueDeletedExternallyBeforeDeduplicationIsRead_RecreatesQueueOnNextCallAsync()
+    {
+        // Arrange
+        string fifoName = GetFifoQueueName();
+        var queue = GetNamedQueue(fifoName, supportDeadLetter: false);
+
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "before" }, new QueueEntryOptions { GroupId = "group", UniqueId = "before" });
+            var queueUrl = await queue.Client.GetQueueUrlAsync(fifoName, TestCancellationToken);
+            await queue.Client.DeleteQueueAsync(queueUrl.QueueUrl, TestCancellationToken);
+
+            // Act
+            await Assert.ThrowsAsync<QueueDoesNotExistException>(() => queue.EnqueueAsync(new SimpleWorkItem { Data = "stale" }, new QueueEntryOptions { GroupId = "group" }));
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "after" }, new QueueEntryOptions { GroupId = "group" });
+
+            // Assert
+            var entry = await queue.DequeueAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(entry);
+            Assert.Equal("after", entry.Value.Data);
+            await entry.CompleteAsync();
+        }
+        finally
+        {
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    private static async Task SetRedrivePolicyAsync(SQSQueue<SimpleWorkItem> queue, string queueName, string deadLetterName)
+    {
+        var queueUrl = await queue.Client.GetQueueUrlAsync(queueName);
+        string redrivePolicy = $$"""{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:{{deadLetterName}}","maxReceiveCount":"10"}""";
+        await queue.Client.SetQueueAttributesAsync(queueUrl.QueueUrl, new Dictionary<string, string> { [QueueAttributeName.RedrivePolicy] = redrivePolicy });
+    }
+
+    private async Task<string?> ReceiveBodyAsync(SQSQueue<SimpleWorkItem> queue, string queueUrl)
+    {
+        var response = await queue.Client.ReceiveMessageAsync(new ReceiveMessageRequest { QueueUrl = queueUrl, WaitTimeSeconds = 2 }, TestCancellationToken);
+        return response.Messages?.SingleOrDefault()?.Body;
+    }
+
+    private static string? Deserialize(string? body) =>
+        body is null ? null : System.Text.Json.JsonSerializer.Deserialize<SimpleWorkItem>(body)?.Data;
+
     private static string GetFifoQueueName() => "foundatio-" + Guid.NewGuid().ToString("N").Substring(10) + ".fifo";
 
-    private SQSQueue<SimpleWorkItem> GetNamedQueue(string name, int retries = 1, bool supportDeadLetter = true)
+    private SQSQueue<SimpleWorkItem> GetNamedQueue(string name, int retries = 1, bool supportDeadLetter = true, TimeSpan? workItemTimeout = null)
     {
         var queue = new SQSQueue<SimpleWorkItem>(o => o
             .ConnectionString("serviceurl=http://localhost:4566;AccessKey=xxx;SecretKey=xxx")
@@ -979,7 +1654,7 @@ public class SQSQueueTests : QueueTestBase
             .Retries(retries)
             .SupportDeadLetter(supportDeadLetter)
             .RetryDelay(_ => TimeSpan.Zero)
-            .WorkItemTimeout(TimeSpan.FromMinutes(5))
+            .WorkItemTimeout(workItemTimeout ?? TimeSpan.FromMinutes(5))
             .DequeueInterval(TimeSpan.FromSeconds(1))
             .ReadQueueTimeout(TimeSpan.FromSeconds(1))
             .MetricsPollingInterval(TimeSpan.Zero)
