@@ -483,6 +483,8 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
     protected override void StartWorkingImpl(Func<IQueueEntry<T>, CancellationToken, Task> handler, bool autoComplete, CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(handler);
+
         _ = StartWorker(handler, autoComplete, cancellationToken);
     }
 
