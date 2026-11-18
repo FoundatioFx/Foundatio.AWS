@@ -50,14 +50,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
 
 
     /// <summary>
-    /// Minimum wait after a failed receive in the worker loop. The SDK already retries transient errors with backoff
-    /// (see <see href="https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html">retry behavior</see>),
-    /// so errors that reach the worker are usually persistent (for example access denied). This keeps them from becoming
-    /// a tight request loop when <c>DequeueInterval</c> is zero.
-    /// </summary>
-    private static readonly TimeSpan MinDequeueErrorBackoff = TimeSpan.FromSeconds(1);
-
-    /// <summary>
     /// SQS attribute changes such as a new redrive policy can take up to 60 seconds to propagate.
     /// See <see href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html">SetQueueAttributes</see>.
     /// </summary>
@@ -83,7 +75,6 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
     private long _dequeuedCount;
     private long _completedCount;
     private long _abandonedCount;
-    private long _workerErrorCount;
 
     public SQSQueue(SQSQueueOptions<T> options) : base(options)
     {
@@ -487,74 +478,14 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
         _dequeuedCount = 0;
         _completedCount = 0;
         _abandonedCount = 0;
-        _workerErrorCount = 0;
+        ResetWorkerErrorCount();
     }
 
     protected override void StartWorkingImpl(Func<IQueueEntry<T>, CancellationToken, Task> handler, bool autoComplete, CancellationToken cancellationToken)
     {
-        if (handler is null)
-            throw new ArgumentNullException(nameof(handler));
+        ArgumentNullException.ThrowIfNull(handler);
 
-        var linkedCancellationTokenSource = GetLinkedDisposableCancellationTokenSource(cancellationToken);
-
-        Task.Run(async () =>
-        {
-            _logger.LogTrace("WorkerLoop Start {QueueName}", _options.Name);
-
-            while (!linkedCancellationTokenSource.IsCancellationRequested)
-            {
-                _logger.LogTrace("WorkerLoop Signaled {QueueName}", _options.Name);
-
-                IQueueEntry<T>? entry = null;
-                try
-                {
-                    // The queue url is cleared when the queue is deleted, so a running worker recreates it before receiving.
-                    await EnsureQueueCreatedAsync(linkedCancellationTokenSource.Token).AnyContext();
-                    entry = await DequeueImplAsync(linkedCancellationTokenSource.Token).AnyContext();
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref _workerErrorCount);
-                    _logger.LogError(ex, "Error on Dequeue: {Message}", ex.Message);
-                    var errorBackoff = _options.DequeueInterval > MinDequeueErrorBackoff ? _options.DequeueInterval : MinDequeueErrorBackoff;
-                    try
-                    {
-                        await Task.Delay(errorBackoff, _timeProvider, linkedCancellationTokenSource.Token).AnyContext();
-                    }
-                    catch (OperationCanceledException) { }
-                }
-
-                if (linkedCancellationTokenSource.IsCancellationRequested || entry is null)
-                    continue;
-
-                try
-                {
-                    await handler(entry, linkedCancellationTokenSource.Token).AnyContext();
-                    if (autoComplete && !entry.IsAbandoned && !entry.IsCompleted && !linkedCancellationTokenSource.IsCancellationRequested)
-                        await entry.CompleteAsync().AnyContext();
-                }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref _workerErrorCount);
-                    _logger.LogError(ex, "Worker error: {Message}", ex.Message);
-
-                    if (!entry.IsAbandoned && !entry.IsCompleted && !linkedCancellationTokenSource.IsCancellationRequested)
-                    {
-                        try
-                        {
-                            await entry.AbandonAsync().AnyContext();
-                        }
-                        catch (Exception abandonEx)
-                        {
-                            _logger.LogError(abandonEx, "Worker error abandoning queue entry {QueueEntryId}; it will be redelivered after its visibility timeout: {Message}", entry.Id, abandonEx.Message);
-                        }
-                    }
-                }
-            }
-
-            _logger.LogTrace("Worker exiting: {QueueName} IsCancellationRequested={IsCancellationRequested}", _options.Name, linkedCancellationTokenSource.IsCancellationRequested);
-        }, linkedCancellationTokenSource.Token).ContinueWith(_ => linkedCancellationTokenSource.Dispose());
+        _ = StartWorker(handler, autoComplete, cancellationToken);
     }
 
     public override void Dispose()
@@ -1030,7 +961,7 @@ public class SQSQueue<T> : QueueBase<T, SQSQueueOptions<T>> where T : class
             Dequeued = _dequeuedCount,
             Completed = _completedCount,
             Abandoned = _abandonedCount,
-            Errors = _workerErrorCount,
+            Errors = WorkerErrorCount,
             Timeouts = 0
         };
     }

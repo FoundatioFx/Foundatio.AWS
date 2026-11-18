@@ -276,6 +276,24 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
+    public override Task StartWorkingAsync_WhenDequeueThrows_KeepsWorkingAsync()
+    {
+        return base.StartWorkingAsync_WhenDequeueThrows_KeepsWorkingAsync();
+    }
+
+    [Fact]
+    public override Task StartWorkingAsync_WhenAbandonThrows_KeepsWorkingAsync()
+    {
+        return base.StartWorkingAsync_WhenAbandonThrows_KeepsWorkingAsync();
+    }
+
+    [Fact]
+    public override Task StartWorkingAsync_WhenCancelled_StopsWithoutWorkerErrorsAsync()
+    {
+        return base.StartWorkingAsync_WhenCancelled_StopsWithoutWorkerErrorsAsync();
+    }
+
+    [Fact]
     public override Task CanHandleErrorInWorkerAsync()
     {
         return base.CanHandleErrorInWorkerAsync();
@@ -1121,7 +1139,44 @@ public class SQSQueueTests : QueueTestBase
     }
 
     [Fact]
-    public async Task StartWorkingAsync_WhenDeadletterQueueIsMissing_KeepsWorkingAndRetriesAsync()
+    public async Task StartWorkingAsync_AfterQueueDeletedExternally_RecreatesQueueAndProcessesMessageAsync()
+    {
+        // Arrange
+        using var workerCancellation = CancellationTokenSource.CreateLinkedTokenSource(TestCancellationToken);
+        workerCancellation.CancelAfter(TimeSpan.FromSeconds(30));
+        var queue = GetNamedQueue(_queueName, supportDeadLetter: false);
+        var completed = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await queue.EnqueueAsync(new SimpleWorkItem { Data = "before" });
+            var url = (await queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken)).QueueUrl;
+            await queue.Client.DeleteQueueAsync(url, TestCancellationToken);
+
+            // Act
+            await queue.StartWorkingAsync(async (entry, _) =>
+            {
+                await entry.CompleteAsync();
+                completed.TrySetResult(entry.Value.Data);
+            }, cancellationToken: workerCancellation.Token);
+            var list = new ListQueuesRequest { QueueNamePrefix = _queueName };
+            while ((await queue.Client.ListQueuesAsync(list, workerCancellation.Token)).QueueUrls is not { Count: > 0 })
+                await Task.Delay(TimeSpan.FromMilliseconds(100), workerCancellation.Token);
+            await queue.Client.SendMessageAsync(url, """{"Data":"after"}""", workerCancellation.Token);
+
+            // Assert
+            Assert.Equal("after", await completed.Task.WaitAsync(workerCancellation.Token));
+        }
+        finally
+        {
+            await workerCancellation.CancelAsync();
+            await CleanupQueueAsync(queue);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StartWorkingAsync_WhenDeadletterQueueIsMissing_KeepsWorkingAndRetriesAsync(bool exhaustedBeforeDequeue)
     {
         // Arrange
         string deadLetterName = _queueName + "-missing";
@@ -1136,9 +1191,17 @@ public class SQSQueueTests : QueueTestBase
         {
             await SetRedrivePolicyAsync(queue, _queueName, deadLetterName);
 
+            if (exhaustedBeforeDequeue)
+            {
+                var url = (await queue.Client.GetQueueUrlAsync(_queueName, TestCancellationToken)).QueueUrl;
+                var receive = new ReceiveMessageRequest { QueueUrl = url, VisibilityTimeout = 0, WaitTimeSeconds = 5 };
+                Assert.Single((await queue.Client.ReceiveMessageAsync(receive, TestCancellationToken)).Messages);
+            }
+
             // Act
             await queue.StartWorkingAsync((_, _) => throw new InvalidOperationException("Handler failure"), cancellationToken: workerCancellation.Token);
-            for (int i = 0; i < 20 && !Log.LogEntries.Any(e => e.Message.Contains("Worker error abandoning queue entry")); i++)
+            string workerError = exhaustedBeforeDequeue ? "Error dequeuing from" : "Worker error abandoning queue entry";
+            for (int i = 0; i < 20 && !Log.LogEntries.Any(e => e.Message.Contains(workerError)); i++)
                 await Task.Delay(TimeSpan.FromMilliseconds(250), TestCancellationToken);
 
             deadLetterUrl = (await queue.Client.CreateQueueAsync(deadLetterName, TestCancellationToken)).QueueUrl;
@@ -1148,7 +1211,7 @@ public class SQSQueueTests : QueueTestBase
             for (int i = 0; i < 5 && body is null; i++)
                 body = await ReceiveBodyAsync(queue, deadLetterUrl);
 
-            Assert.Contains(Log.LogEntries, e => e.Message.Contains("Worker error abandoning queue entry"));
+            Assert.Contains(Log.LogEntries, e => e.Message.Contains(workerError));
             Assert.Contains("retried", body);
         }
         finally
